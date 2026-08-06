@@ -565,8 +565,8 @@ function App() {
           <DialogDescription>将 Codex 的全局请求入口切换到本机 Gateway。</DialogDescription>
         </DialogHeader>
         <div className="min-h-0 overflow-y-auto px-5 py-5 text-sm leading-6 text-muted-foreground sm:px-6">
-          <p>当前模型名会保留并原样转发；其它个人配置不会被覆盖。</p>
-          <p className="mt-3">现有 <code className="font-mono text-xs text-foreground">config.toml</code> 和 <code className="font-mono text-xs text-foreground">auth.json</code> 会先在本机创建备份。本地访问令牌不会发送到页面。</p>
+          <p>当前模型名会保留并原样转发。已有自定义 provider 会保持名称；没有 provider 时才会创建 <code className="font-mono text-xs text-foreground">codex_gateway</code>。</p>
+          <p className="mt-3">现有 <code className="font-mono text-xs text-foreground">config.toml</code> 和 <code className="font-mono text-xs text-foreground">auth.json</code> 会先在本机创建备份。当前 provider 的旧认证会切换为本地 Gateway 令牌，原始内容可从备份恢复。</p>
           <p className="mt-3 text-foreground">完成后请重启 Codex，使新配置生效。</p>
         </div>
         <DialogFooter className="border-t border-border bg-secondary/45 px-5 py-4 sm:px-6">

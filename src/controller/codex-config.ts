@@ -6,6 +6,8 @@ import { parse as parseToml } from "@iarna/toml";
 
 const windowsRetryCount = 3;
 const windowsRetryDelayMs = 80;
+const gatewayProviderId = "codex_gateway";
+const gatewayProviderName = "Codex Gateway";
 
 type PathApi = Pick<typeof path, "join" | "resolve">;
 type JsonObject = Record<string, unknown>;
@@ -204,6 +206,23 @@ function escapeRegExp(value: string): string {
 }
 
 /**
+ * 查找指定自定义 provider 的顶层 TOML 表及其直接配置区域。
+ * @param content 当前 TOML 文本。
+ * @param providerId provider 标识。
+ * @returns 表头、直接配置区域与后续 TOML 内容；未找到时返回 null。
+ * @remarks 直接配置区域不包含下一个表或嵌套表，便于安全更新单个 provider 字段。
+ */
+function providerTableParts(content: string, providerId: string): { before: string; body: string; after: string } | null {
+  const header = new RegExp(`^[\\t ]*\\[\\s*model_providers\\.${escapeRegExp(providerId)}\\s*\\][^\\r\\n]*(?:\\r?\\n|$)`, "m");
+  const match = header.exec(content);
+  if (!match || match.index === undefined) return null;
+  const bodyStart = match.index + match[0].length;
+  const nextTable = content.slice(bodyStart).search(/^\s*\[/m);
+  const bodyEnd = nextTable < 0 ? content.length : bodyStart + nextTable;
+  return { before: content.slice(0, bodyStart), body: content.slice(bodyStart, bodyEnd), after: content.slice(bodyEnd) };
+}
+
+/**
  * 更新当前自定义 provider 表中的单个键，不创建新的 provider 表。
  * @param content 当前 TOML 文本。
  * @param providerId 当前 model_provider 标识。
@@ -214,20 +233,82 @@ function escapeRegExp(value: string): string {
  */
 function setProviderValue(content: string, providerId: string, key: string, value: string): string {
   const lineEnding = content.includes("\r\n") ? "\r\n" : "\n";
-  const header = new RegExp(`^[\\t ]*\\[\\s*model_providers\\.${escapeRegExp(providerId)}\\s*\\][^\\r\\n]*(?:\\r?\\n|$)`, "m");
+  const parts = providerTableParts(content, providerId);
+  if (!parts) throw new Error("当前 model_provider 未定义可更新的 provider，未执行配置。");
+  const expression = new RegExp(`^([\\t ]*${key}[\\t ]*=[\\t ]*)[^#\\r\\n]*((?:[\\t ]*#.*)?)$`, "m");
+  const nextBody = expression.test(parts.body)
+    ? parts.body.replace(expression, `$1${value}$2`)
+    : `${key} = ${value}${lineEnding}${parts.body}`;
+  return `${parts.before}${nextBody}${parts.after}`;
+}
+
+/**
+ * 从自定义 provider 的直接配置区域移除单个字段。
+ * @param content 当前 TOML 文本。
+ * @param providerId provider 标识。
+ * @param key 需要移除的字段名。
+ * @returns 删除字段后的 TOML 文本；字段或 provider 不存在时保持原样。
+ * @remarks 仅删除与 Gateway 认证互斥的字段，原始内容由一键配置的备份文件保留。
+ */
+function removeProviderValue(content: string, providerId: string, key: string): string {
+  const parts = providerTableParts(content, providerId);
+  if (!parts) return content;
+  const expression = new RegExp(`^[\\t ]*${key}[\\t ]*=[^\\r\\n]*(?:\\r?\\n|$)`, "m");
+  return `${parts.before}${parts.body.replace(expression, "")}${parts.after}`;
+}
+
+/**
+ * 移除自定义 provider 下与 Gateway 认证互斥的嵌套配置表。
+ * @param content 当前 TOML 文本。
+ * @param providerId provider 标识。
+ * @param tableName 需要移除的嵌套表名。
+ * @returns 删除嵌套表后的 TOML 文本；嵌套表不存在时保持原样。
+ * @remarks 只处理本功能使用的直接嵌套表，例如 `auth`，不会影响同级其它 provider。
+ */
+function removeProviderSubtable(content: string, providerId: string, tableName: string): string {
+  const header = new RegExp(`^[\\t ]*\\[\\s*model_providers\\.${escapeRegExp(providerId)}\\.${escapeRegExp(tableName)}\\s*\\][^\\r\\n]*(?:\\r?\\n|$)`, "m");
   const match = header.exec(content);
-  if (!match || match.index === undefined) throw new Error("当前 model_provider 未定义可更新的 provider，未执行配置。");
+  if (!match || match.index === undefined) return content;
   const bodyStart = match.index + match[0].length;
   const nextTable = content.slice(bodyStart).search(/^\s*\[/m);
-  const bodyEnd = nextTable < 0 ? content.length : bodyStart + nextTable;
-  const before = content.slice(0, bodyStart);
-  const body = content.slice(bodyStart, bodyEnd);
-  const after = content.slice(bodyEnd);
-  const expression = new RegExp(`^([\\t ]*${key}[\\t ]*=[\\t ]*)[^#\\r\\n]*((?:[\\t ]*#.*)?)$`, "m");
-  const nextBody = expression.test(body)
-    ? body.replace(expression, `$1${value}$2`)
-    : `${key} = ${value}${lineEnding}${body}`;
-  return `${before}${nextBody}${after}`;
+  const end = nextTable < 0 ? content.length : bodyStart + nextTable;
+  return `${content.slice(0, match.index)}${content.slice(end)}`;
+}
+
+/**
+ * 在 TOML 末尾创建供 Gateway 使用的自定义 provider 表。
+ * @param content 当前 TOML 文本。
+ * @param providerId 新建 provider 标识。
+ * @param baseUrl Gateway 的 Responses API 基础地址。
+ * @returns 含新 provider 表的 TOML 文本。
+ * @remarks 调用方须先确认同名 provider 表不存在，避免覆盖用户已有配置。
+ */
+function appendGatewayProvider(content: string, providerId: string, baseUrl: string): string {
+  const lineEnding = content.includes("\r\n") ? "\r\n" : "\n";
+  const prefix = content && !content.endsWith("\n") && !content.endsWith("\r") ? lineEnding : "";
+  const separator = content ? lineEnding : "";
+  return `${content}${prefix}${separator}[model_providers.${providerId}]${lineEnding}name = ${tomlString(gatewayProviderName)}${lineEnding}base_url = ${tomlString(baseUrl)}${lineEnding}wire_api = "responses"${lineEnding}requires_openai_auth = true${lineEnding}`;
+}
+
+/**
+ * 将一个已有自定义 provider 的地址和认证方式切换为本机 Gateway。
+ * @param content 当前 TOML 文本。
+ * @param providerId 保持不变的现有 provider 标识。
+ * @param baseUrl Gateway 的 Responses API 基础地址。
+ * @returns 更新后的 TOML 文本。
+ * @throws 当前 provider 表不存在时抛出中文错误。
+ * @remarks Gateway 使用 auth.json 中的本地令牌，因此会移除与 `requires_openai_auth` 互斥的旧认证字段与 auth 表。
+ */
+function configureExistingProvider(content: string, providerId: string, baseUrl: string): string {
+  if (!providerTableParts(content, providerId)) throw new Error("当前 model_provider 未定义可更新的 provider，未执行配置。");
+  let configured = content;
+  configured = removeProviderValue(configured, providerId, "env_key");
+  configured = removeProviderValue(configured, providerId, "env_key_instructions");
+  configured = removeProviderValue(configured, providerId, "experimental_bearer_token");
+  configured = removeProviderSubtable(configured, providerId, "auth");
+  configured = setProviderValue(configured, providerId, "base_url", tomlString(baseUrl));
+  configured = setProviderValue(configured, providerId, "wire_api", '"responses"');
+  return setProviderValue(configured, providerId, "requires_openai_auth", "true");
 }
 
 /**
@@ -236,7 +317,7 @@ function setProviderValue(content: string, providerId: string, key: string, valu
  * @param gatewayHost 本地 Gateway 监听地址。
  * @param gatewayPort 本地 Gateway 监听端口。
  * @returns 已通过 TOML 语法校验的配置文本。
- * @throws 现有配置、认证冲突或当前 provider 不存在时抛出中文错误。
+ * @throws 现有配置不合法或当前自定义 provider 不存在时抛出中文错误。
  */
 export function mergeCodexConfig(current: string | null, gatewayHost: string, gatewayPort: number): string {
   if (!Number.isInteger(gatewayPort) || gatewayPort < 1 || gatewayPort > 65_535) throw new Error("本地 Gateway 端口无效，未执行配置。");
@@ -245,28 +326,20 @@ export function mergeCodexConfig(current: string | null, gatewayHost: string, ga
   const parsed = current === null ? {} : parseTomlConfig(existing, "当前");
   const currentProvider = typeof parsed.model_provider === "string" && parsed.model_provider.trim()
     ? parsed.model_provider.trim()
-    : "openai";
+    : null;
   const baseUrl = `http://${gatewayHost}:${gatewayPort}/v1`;
   let merged = existing;
   merged = setRootString(merged, "preferred_auth_method", "apikey");
   merged = setRootString(merged, "cli_auth_credentials_store", "file");
   if (currentProvider === "openai") {
     merged = setRootString(merged, "openai_base_url", baseUrl);
+  } else if (currentProvider) {
+    merged = configureExistingProvider(merged, currentProvider, baseUrl);
   } else {
-    const providers = parsed.model_providers;
-    const provider = providers && typeof providers === "object" && !Array.isArray(providers)
-      ? (providers as JsonObject)[currentProvider]
-      : undefined;
-    if (!provider || typeof provider !== "object" || Array.isArray(provider)) {
-      throw new Error("当前 model_provider 未定义可更新的 provider，未执行配置。");
-    }
-    const providerConfig = provider as JsonObject;
-    if ("env_key" in providerConfig || "auth" in providerConfig || "experimental_bearer_token" in providerConfig) {
-      throw new Error("当前 provider 使用了不兼容的认证方式，未执行配置。");
-    }
-    merged = setProviderValue(merged, currentProvider, "base_url", tomlString(baseUrl));
-    merged = setProviderValue(merged, currentProvider, "wire_api", '"responses"');
-    merged = setProviderValue(merged, currentProvider, "requires_openai_auth", "true");
+    merged = setRootString(merged, "model_provider", gatewayProviderId);
+    merged = providerTableParts(merged, gatewayProviderId)
+      ? configureExistingProvider(merged, gatewayProviderId, baseUrl)
+      : appendGatewayProvider(merged, gatewayProviderId, baseUrl);
   }
   validateToml(merged, "生成的");
   return merged;

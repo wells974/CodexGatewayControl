@@ -27,7 +27,7 @@ Model: 当前中转支持的任意模型名
 
 Gateway 会使用保存的上游 API Key 向中转发请求，不会将它暴露给 Codex 或浏览器。
 
-也可以在管理页“Codex 请求入口”区域点击“一键配置”。该操作不会新建或切换 `model_provider`：默认 `openai` provider 会更新 `openai_base_url`，已有自定义 provider 则在原 provider 表中更新本机 Gateway 地址，并把 `.env` 中的 `GATEWAY_ACCESS_TOKEN` 写入 Codex 的 `auth.json`。它兼容 macOS 与 Windows，使用 `CODEX_HOME`，未设置时使用当前用户目录下的 `.codex`；操作前会在本机创建带时间戳的备份。配置会保留当前模型名和其它个人设置，完成后需要重启 Codex。
+也可以在管理页“Codex 请求入口”区域点击“一键配置”。已有自定义 `model_provider` 时，操作会保留其名称并在原 provider 表中更新本机 Gateway 地址；没有 `model_provider` 时，才会创建并选择 `codex_gateway`。内置 `openai` provider 不能定义在 `model_providers` 中，因此会保留其名称并更新顶层 `openai_base_url`。Gateway 使用 `.env` 中的 `GATEWAY_ACCESS_TOKEN`，原 provider 的环境变量、直接令牌或命令认证会切换为该本地令牌，原始内容保存在自动备份中。它兼容 macOS 与 Windows，使用 `CODEX_HOME`，未设置时使用当前用户目录下的 `.codex`；操作前会在本机创建带时间戳的备份。配置会保留当前模型名，完成后需要重启 Codex。
 
 ## API
 

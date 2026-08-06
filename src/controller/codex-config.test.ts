@@ -76,11 +76,51 @@ test("合并配置保留模型、当前 provider 标识和无关设置，并可�
   assert.equal(second.includes("codex_gateway_control"), false);
 });
 
-test("默认 openai provider 只更新 openai_base_url，不创建 model_providers", () => {
+test("没有 model_provider 时创建并选择 codex_gateway provider", () => {
   const configured = mergeCodexConfig('model = "gpt-5.6"\n', "127.0.0.1", 4000);
+  assert.match(configured, /model_provider = "codex_gateway"/);
+  assert.match(configured, /\[model_providers\.codex_gateway\]/);
+  assert.match(configured, /base_url = "http:\/\/127\.0\.0\.1:4000\/v1"/);
+  assert.match(configured, /wire_api = "responses"/);
+  assert.match(configured, /requires_openai_auth = true/);
+  assert.equal(configured.includes("openai_base_url"), false);
+});
+
+test("内置 openai provider 保持名称并使用 openai_base_url", () => {
+  const configured = mergeCodexConfig('model_provider = "openai"\n', "127.0.0.1", 4000);
+  assert.match(configured, /model_provider = "openai"/);
   assert.match(configured, /openai_base_url = "http:\/\/127\.0\.0\.1:4000\/v1"/);
-  assert.equal(configured.includes("model_provider ="), false);
-  assert.equal(configured.includes("[model_providers."), false);
+  assert.equal(configured.includes("[model_providers.openai]"), false);
+});
+
+test("已有自定义 provider 保持名称并切换为 Gateway 认证", () => {
+  const source = [
+    'model_provider = "legacy"',
+    "",
+    "[model_providers.legacy]",
+    'name = "Legacy"',
+    'base_url = "https://legacy.example/v1"',
+    'env_key = "LEGACY_API_KEY"',
+    'env_key_instructions = "旧凭据"',
+    'experimental_bearer_token = "legacy-token"',
+    "",
+    "[model_providers.legacy.auth]",
+    'command = "legacy-token-command"',
+    "",
+    "[features]",
+    "goals = true",
+    ""
+  ].join("\n");
+  const configured = mergeCodexConfig(source, "127.0.0.1", 4000);
+  assert.match(configured, /model_provider = "legacy"/);
+  assert.match(configured, /name = "Legacy"/);
+  assert.match(configured, /base_url = "http:\/\/127\.0\.0\.1:4000\/v1"/);
+  assert.match(configured, /wire_api = "responses"/);
+  assert.match(configured, /requires_openai_auth = true/);
+  assert.match(configured, /\[features\]\ngoals = true/);
+  assert.equal(configured.includes("env_key"), false);
+  assert.equal(configured.includes("experimental_bearer_token"), false);
+  assert.equal(configured.includes("[model_providers.legacy.auth]"), false);
 });
 
 test("一键配置创建备份且不返回或写出接口外的敏感信息", async () => {
@@ -104,6 +144,27 @@ test("一键配置创建备份且不返回或写出接口外的敏感信息", as
     assert.equal(auth.OPENAI_API_KEY, "local-gateway-token");
     assert.equal(auth.auth_mode, "apikey");
     assert.equal(names.filter((name) => name.includes("gateway-backup")).length, 2);
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("配置文件不存在时创建 codex_gateway provider 与本地认证", async () => {
+  const directory = await temporaryCodexHome();
+  await rm(directory, { force: true, recursive: true });
+  try {
+    const result = await configureCodex({
+      accessToken: "local-gateway-token",
+      gatewayHost: "127.0.0.1",
+      gatewayPort: 4000,
+      codexHome: directory
+    });
+    const config = await readTemporaryFile(directory, "config.toml");
+    const auth = JSON.parse(await readTemporaryFile(directory, "auth.json")) as Record<string, unknown>;
+    assert.equal(result.backupsCreated, 0);
+    assert.match(config, /model_provider = "codex_gateway"/);
+    assert.match(config, /\[model_providers\.codex_gateway\]/);
+    assert.equal(auth.OPENAI_API_KEY, "local-gateway-token");
   } finally {
     await rm(directory, { force: true, recursive: true });
   }

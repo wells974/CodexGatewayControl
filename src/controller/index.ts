@@ -140,7 +140,6 @@ function publicCodexConfigurationError(error: unknown): string {
     "当前 Codex config.toml 格式无效，未执行配置。",
     "当前 Codex auth.json 格式无效，未执行配置。",
     "当前 model_provider 未定义可更新的 provider，未执行配置。",
-    "当前 provider 使用了不兼容的认证方式，未执行配置。",
     "本地 Gateway 端口无效，未执行配置。",
     "本地 Gateway 地址无效，未执行配置。",
     "Codex 配置目录无效，未执行配置。"
