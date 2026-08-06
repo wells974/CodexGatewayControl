@@ -2,7 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import WebSocket from "ws";
@@ -19,7 +19,9 @@ function parseArgs(argv) {
     attachExisting: false,
     watch: false,
     open: false,
-    appPath: process.env.CODEX_APP_PATH || "/Applications/ChatGPT.app"
+    forceReload: false,
+    appPath: process.env.CODEX_APP_PATH || "/Applications/ChatGPT.app",
+    userDataDir: path.resolve(process.env.CODEX_CDP_USER_DATA_DIR || ".data/codex-cdp-profile")
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -27,8 +29,11 @@ function parseArgs(argv) {
     else if (arg === "--attach-existing") options.attachExisting = true;
     else if (arg === "--watch") options.watch = true;
     else if (arg === "--open") options.open = true;
+    else if (arg === "--force-reload") options.forceReload = true;
+    else if (arg === "--skip-reload") options.forceReload = false;
     else if (arg === "--port") options.port = Number(argv[++index]);
     else if (arg === "--app-path") options.appPath = path.resolve(argv[++index]);
+    else if (arg === "--user-data-dir") options.userDataDir = path.resolve(argv[++index]);
     else throw new Error(`未知选项：${arg}`);
   }
   if (!Number.isInteger(options.port) || options.port < 1024 || options.port > 65535) {
@@ -87,13 +92,37 @@ async function ensureController() {
   }
 }
 
-function launchCodex(appPath, port) {
+/**
+ * 返回 macOS app bundle 内的主可执行文件路径。
+ * @param {string} appPath ChatGPT 或 Codex 的 `.app` bundle 路径。
+ * @returns {string} 可由 Node 直接启动的 Electron 主进程路径。
+ * @throws 路径不存在时由后续 `spawn` 以系统错误形式报告。
+ */
+function desktopExecutable(appPath) {
+  return path.join(appPath, "Contents", "MacOS", path.basename(appPath, ".app"));
+}
+
+/**
+ * 使用独立 profile 启动可调试的 Codex，避免 macOS `open` 将参数转发给已有实例后丢失。
+ * @param {string} appPath ChatGPT 或 Codex 的 `.app` bundle 路径。
+ * @param {number} port 仅绑定到 loopback 的 CDP 端口。
+ * @param {string} userDataDir 独立实例的持久用户数据目录。
+ * @returns {Promise<import("node:child_process").ChildProcess>} 已启动的 Desktop 主进程。
+ * @throws 创建 profile 目录失败时抛出文件系统错误。
+ * @remarks `LocalNetworkAccessChecks` 仅为隔离 profile 关闭，以允许 blob Gateway 页面请求本机 Controller；不得用当前日常 Codex profile 启动该实例。
+ */
+async function launchCodex(appPath, port, userDataDir) {
+  await mkdir(userDataDir, { recursive: true });
   console.log(`正在 CDP 端口 ${port} 启动独立的 Gateway-enabled Codex 实例...`);
-  return spawn("/usr/bin/open", [
-    "-n", "-a", appPath, "--args",
+  console.log(`独立 Codex profile：${userDataDir}`);
+  const child = spawn(desktopExecutable(appPath), [
+    `--user-data-dir=${userDataDir}`,
     `--remote-debugging-port=${port}`,
-    `--remote-allow-origins=http://127.0.0.1:${port}`
-  ], { stdio: "ignore" });
+    `--remote-allow-origins=http://127.0.0.1:${port}`,
+    "--disable-features=LocalNetworkAccessChecks"
+  ], { stdio: "ignore", detached: true });
+  child.unref();
+  return child;
 }
 
 class CdpConnection {
@@ -139,12 +168,41 @@ class CdpConnection {
     });
   }
 
+  /**
+   * 向当前 renderer 发送一个 CDP 命令，并在调试连接半断开时主动超时。
+   * @param {string} method CDP 协议方法名。
+   * @param {object} params CDP 方法参数。
+   * @returns {Promise<object>} CDP 返回结果。
+   * @throws 连接关闭、WebSocket 写入失败或 15 秒内未收到对应响应时抛出错误。
+   */
   send(method, params = {}) {
     if (this.closed) return Promise.reject(new Error("CDP 连接已关闭"));
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.socket.send(JSON.stringify({ id, method, params }));
+      const timer = setTimeout(() => {
+        if (!this.pending.has(id)) return;
+        this.pending.delete(id);
+        this.closed = true;
+        this.socket.terminate();
+        reject(new Error(`CDP ${method} 响应超时`));
+      }, 15_000);
+      this.pending.set(id, {
+        resolve: (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      });
+      try {
+        this.socket.send(JSON.stringify({ id, method, params }));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
@@ -177,9 +235,13 @@ async function cdpTargets(port) {
   const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2_000) });
   if (!response.ok) throw new Error(`CDP target 发现请求返回 ${response.status}`);
   const targets = await response.json();
-  return targets.filter((target) => target.type === "page" && target.webSocketDebuggerUrl && (
-    target.url?.startsWith("app://") || target.url?.startsWith("codex://") || /codex|chatgpt/i.test(target.title || "")
-  ));
+  return targets.filter((target) => {
+    if (target.type !== "page" || !target.webSocketDebuggerUrl) return false;
+    const url = target.url || "";
+    const isOverlay = /initialRoute=%2F(?:avatar-overlay|global-dictation)/i.test(url);
+    const looksLikeCodex = url.startsWith("app://") || url.startsWith("codex://") || /codex|chatgpt/i.test(target.title || "");
+    return looksLikeCodex && !isOverlay;
+  });
 }
 
 async function waitForCodexTarget(port, timeoutMs) {
@@ -194,9 +256,25 @@ async function waitForCodexTarget(port, timeoutMs) {
   throw new Error(`CDP 端口 ${port} 上未出现 Codex renderer target`);
 }
 
+/**
+ * 读取注入脚本和公开 Gateway HTML，并生成可热更新的 document-start 源码。
+ * @returns {Promise<{hash: string, source: string}>} 注入源码及包含 HTML 内容的 SHA-256 标识。
+ * @throws Controller 不可达、返回非成功状态或本地注入文件无法读取时抛出错误。
+ * @remarks HTML 仅包含页面骨架和静态资源引用，不含 Cookie、访问令牌、上游密钥或管理 API 响应。
+ */
 async function currentSource() {
   const userSource = await readFile(injectionPath, "utf8");
-  const runtime = `window.__CODEX_GATEWAY_URL__ = ${JSON.stringify(`${controllerUrl}/`)};\n${userSource}`;
+  const pageResponse = await fetch(`${controllerUrl}/`, {
+    headers: { accept: "text/html" },
+    signal: AbortSignal.timeout(8_000)
+  });
+  if (!pageResponse.ok) throw new Error(`读取 Gateway 公开页面失败：HTTP ${pageResponse.status}`);
+  const pageHtml = await pageResponse.text();
+  const runtime = [
+    `window.__CODEX_GATEWAY_URL__ = ${JSON.stringify(`${controllerUrl}/`)};`,
+    `window.__CODEX_GATEWAY_BLOB_HTML__ = ${JSON.stringify(pageHtml)};`,
+    userSource
+  ].join("\n");
   const hash = createHash("sha256").update(runtime).digest("hex");
   return {
     hash,
@@ -235,8 +313,9 @@ async function waitForStatus(cdp, sourceHash, shouldOpen, timeoutMs) {
   let status;
   while (Date.now() < deadline) {
     status = await injectionStatus(cdp);
+    if (shouldOpen && status?.frameError) return status;
     const ready = status?.sourceHash === sourceHash && status.entryMounted;
-    const frameReady = !shouldOpen || (status?.pageVisible && status.frameUrl && status.frameLoaded);
+    const frameReady = !shouldOpen || (status?.pageVisible && status.frameUrl && status.frameLoaded && status.frameReady);
     if (ready && frameReady) return status;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
@@ -256,7 +335,18 @@ async function replaceDocumentScript(cdp, state, source) {
   state.scriptIdentifier = registration.identifier;
 }
 
-async function injectTarget(target, source, hash, shouldOpen, states) {
+/**
+ * 将 Gateway 注入到一个 renderer target，并保留连接供后续恢复使用。
+ * @param {object} target CDP discovery 返回的 Codex page target。
+ * @param {string} source 带 source hash 的注入脚本文本。
+ * @param {string} hash 当前注入脚本的 SHA-256 标识。
+ * @param {boolean} shouldOpen 是否在注入后立即打开 iframe。
+ * @param {Map<string, object>} states 已连接 target 的状态表。
+ * @param {boolean} forceReload 是否在首次注入时 reload renderer，使 CSP bypass 对 iframe 生效。
+ * @returns {Promise<object>} 已注入 target 的状态与 iframe 验证结果。
+ * @throws CDP 命令失败、入口未挂载、iframe 未就绪或 iframe 返回加载错误时抛出错误。
+ */
+async function injectTarget(target, source, hash, shouldOpen, states, forceReload) {
   let state = states.get(target.id);
   if (!state || state.cdp.closed) {
     const cdp = new CdpConnection(target.webSocketDebuggerUrl);
@@ -275,7 +365,7 @@ async function injectTarget(target, source, hash, shouldOpen, states) {
     state.sourceHash = hash;
     await evaluate(cdp, source);
   }
-  if (!state.reloaded) {
+  if (forceReload && !state.reloaded) {
     state.reloaded = true;
     const loaded = cdp.waitFor("Page.loadEventFired", 15_000);
     await cdp.send("Page.reload", { ignoreCache: true });
@@ -284,12 +374,23 @@ async function injectTarget(target, source, hash, shouldOpen, states) {
   await evaluate(cdp, source);
   if (shouldOpen) await cdp.send("Runtime.evaluate", { expression: "window.__codexGatewayInjection__?.open()", returnByValue: true });
   const status = await waitForStatus(cdp, hash, shouldOpen, 15_000);
-  const frameLoaded = shouldOpen ? await waitForFrame(cdp, status.frameUrl, 15_000) : false;
-  if (shouldOpen && !frameLoaded) throw new Error("Gateway iframe 元素已挂载，但其 frame 未完成加载");
+  const frameLoaded = shouldOpen && !status.frameError ? await waitForFrame(cdp, status.frameUrl, 15_000) : false;
+  if (shouldOpen && !status.frameError && !frameLoaded) throw new Error("Gateway iframe 元素已挂载，但其 frame 未完成加载");
   return { targetId: target.id, title: target.title, url: target.url, cspBypassed: true, frameLoaded, ...status };
 }
 
-async function reconcile(port, source, hash, shouldOpen, states) {
+/**
+ * 对当前存活的 Codex renderer 进行连接回收、发现与注入。
+ * @param {number} port CDP loopback 端口。
+ * @param {string} source 注入脚本文本。
+ * @param {string} hash 注入脚本的 SHA-256 标识。
+ * @param {boolean} shouldOpen 是否立即打开 Gateway。
+ * @param {Map<string, object>} states 已连接 target 的状态表。
+ * @param {boolean} forceReload 是否在首次注入时 reload renderer。
+ * @returns {Promise<object[]>} 所有当前 renderer 的注入状态。
+ * @throws 找不到 Codex renderer 或任一首轮注入失败时抛出错误。
+ */
+async function reconcile(port, source, hash, shouldOpen, states, forceReload) {
   const targets = await cdpTargets(port);
   if (!targets.length) throw new Error("未找到 Codex renderer target");
   const activeIds = new Set(targets.map((target) => target.id));
@@ -302,11 +403,37 @@ async function reconcile(port, source, hash, shouldOpen, states) {
   const results = [];
   for (const target of targets) {
     const openThisTarget = shouldOpen && results.length === 0 && ![...states.values()].some((state) => state.opened);
-    const result = await injectTarget(target, source, hash, openThisTarget, states);
+    const result = await injectTarget(target, source, hash, openThisTarget, states, forceReload);
     if (openThisTarget) states.get(target.id).opened = true;
     results.push(result);
   }
   return results;
+}
+
+/**
+ * 在 Codex 初始化期间反复发现 renderer 并完成首轮注入。
+ * @param {number} port CDP loopback 端口。
+ * @param {string} source 注入脚本文本。
+ * @param {string} hash 注入脚本的 SHA-256 标识。
+ * @param {boolean} shouldOpen 是否在成功后打开 Gateway iframe。
+ * @param {Map<string, object>} states 已连接 target 的状态表。
+ * @returns {Promise<object[]>} 每个成功注入 renderer 的状态。
+ * @throws 超过初始化时限仍无法完成注入时抛出最后一次错误。
+ */
+async function reconcileUntilReady(port, source, hash, shouldOpen, states, forceReload) {
+  const deadline = Date.now() + 30_000;
+  let lastError = new Error("Codex renderer 尚未就绪");
+  while (Date.now() < deadline) {
+    try {
+      return await reconcile(port, source, hash, shouldOpen, states, forceReload);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      states.forEach((state) => state.cdp.close());
+      states.clear();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+  throw lastError;
 }
 
 async function main() {
@@ -333,12 +460,20 @@ async function main() {
       throw new Error(`无法附加：Codex CDP 未监听 127.0.0.1:${options.port}。请使用 --remote-debugging-port=${options.port} 启动 Codex，或运行 npm run codex 创建独立的 Gateway-enabled 实例。`);
     }
     if (!cdpAvailable && options.launch) {
-      launchCodex(options.appPath, options.port);
+      await launchCodex(options.appPath, options.port, options.userDataDir);
       await waitFor(cdpVersion, 30_000, `Codex CDP on port ${options.port}`);
     }
     await waitForCodexTarget(options.port, 30_000);
     let current = await currentSource();
-    const first = await reconcile(options.port, current.source, current.hash, options.open, states);
+    if (options.forceReload) console.log("已启用首次 renderer reload，以让 CSP bypass 对 Gateway iframe 生效。");
+    const first = await reconcileUntilReady(
+      options.port,
+      current.source,
+      current.hash,
+      options.open,
+      states,
+      options.forceReload,
+    );
     console.log(JSON.stringify({ injected: first }, null, 2));
     if (!options.watch) return;
 
@@ -350,7 +485,7 @@ async function main() {
         }
         const latest = await currentSource();
         current = latest;
-        const results = await reconcile(options.port, latest.source, latest.hash, false, states);
+        const results = await reconcile(options.port, latest.source, latest.hash, false, states, options.forceReload);
         if (results.length) console.log(JSON.stringify({ reconciled: results }, null, 2));
       } catch (error) {
         if (!stopping) console.error(`Gateway 启动器正在等待 Codex：${error.message}`);

@@ -14,6 +14,7 @@ import {
   type Upstream
 } from "./database.js";
 import { proxyRequest } from "./proxy.js";
+import { configureCodex } from "./codex-config.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,6 +24,61 @@ const probes = new Map<string, Probe>();
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const app = express();
 app.disable("x-powered-by");
+const codexEmbedOrigin = "app://-";
+
+/**
+ * 判断请求来源是否是本机管理页或受支持的 Codex blob 嵌入页。
+ * @param origin 浏览器发送的 Origin 请求头。
+ * @returns 来源允许访问本机 Controller 时返回 true。
+ * @remarks 不接受任意 Origin，避免将本地管理接口暴露给其他网页。
+ */
+function isAllowedControllerOrigin(origin: string | undefined): boolean {
+  return !origin || /^http:\/\/127\.0\.0\.1(?::\d+)?$/.test(origin) || origin === codexEmbedOrigin;
+}
+
+/**
+ * 为 Codex blob 嵌入页添加受限的凭据 CORS 响应头。
+ * @param request Express 请求对象。
+ * @param response Express 响应对象。
+ * @param next 继续处理下一个中间件的回调。
+ * @returns 无返回值。
+ * @remarks 仅允许固定 `app://-` origin，Cookie 本身仍为 HttpOnly，绝不返回给页面脚本。
+ */
+function allowCodexEmbedCors(request: Request, response: Response, next: NextFunction): void {
+  if (request.header("origin") !== codexEmbedOrigin) {
+    next();
+    return;
+  }
+  response.setHeader("access-control-allow-origin", codexEmbedOrigin);
+  response.setHeader("access-control-allow-credentials", "true");
+  response.setHeader("access-control-allow-methods", "GET, POST, PATCH, DELETE, OPTIONS");
+  response.setHeader("access-control-allow-headers", "content-type");
+  response.setHeader("vary", "Origin");
+  if (request.method === "OPTIONS") {
+    response.sendStatus(204);
+    return;
+  }
+  next();
+}
+
+/**
+ * 写入仅由浏览器自动携带的本地管理会话 Cookie。
+ * @param request Express 请求对象，用于识别普通浏览器或 Codex blob 嵌入页。
+ * @param response Express 响应对象。
+ * @returns 无返回值。
+ * @remarks 嵌入页使用 `SameSite=None; Secure` 以支持受限跨 origin 请求；Cookie 值不会进入 HTML、CDP 或日志。
+ */
+function issueSessionCookie(request: Request, response: Response): void {
+  const embedded = request.header("origin") === codexEmbedOrigin;
+  response.cookie("gateway_session", sessionCookieValue(), {
+    httpOnly: true,
+    sameSite: embedded ? "none" : "strict",
+    secure: embedded,
+    path: "/"
+  });
+}
+
+app.use(allowCodexEmbedCors);
 app.use("/api", express.json({ limit: "32kb" }));
 
 function cookies(request: Request): Record<string, string> {
@@ -37,7 +93,7 @@ function requireLocalToken(request: Request, response: Response, next: NextFunct
   const expected = Buffer.from(sessionCookieValue());
   const valid = Boolean(supplied && supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected));
   const origin = request.header("origin");
-  if (!valid || (origin && !/^http:\/\/127\.0\.0\.1(?::\d+)?$/.test(origin))) {
+  if (!valid || !isAllowedControllerOrigin(origin)) {
     response.status(401).json({ error: "需要本地 Controller 会话令牌。" });
     return;
   }
@@ -65,10 +121,50 @@ function publicStatus() {
   const active = activeUpstream();
   return {
     gateway: { healthy: true, baseUrl: `http://${config.host}:${config.port}`, proxyPath: "/v1/*" },
+    codexConfiguration: { available: Boolean(config.accessToken.trim()) },
     activeUpstream: active ? { id: active.id, name: active.name, apiBase: active.apiBase } : null,
     upstreams: listUpstreams().map((upstream) => ({ ...upstream, ...probes.get(upstream.id) })),
     notice: "网关会将每个 Codex 请求原样转发到当前中转，不改写模型名或流式响应。切换只影响后续请求。"
   };
+}
+
+/**
+ * 将本地配置失败原因转换为不包含路径、凭据或底层错误详情的管理页提示。
+ * @param error 配置服务抛出的原始错误。
+ * @returns 可安全返回给浏览器的中文错误。
+ */
+function publicCodexConfigurationError(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  const allowed = [
+    "未设置 GATEWAY_ACCESS_TOKEN，无法配置 Codex 认证。",
+    "当前 Codex config.toml 格式无效，未执行配置。",
+    "当前 Codex auth.json 格式无效，未执行配置。",
+    "当前 model_provider 未定义可更新的 provider，未执行配置。",
+    "当前 provider 使用了不兼容的认证方式，未执行配置。",
+    "本地 Gateway 端口无效，未执行配置。",
+    "本地 Gateway 地址无效，未执行配置。",
+    "Codex 配置目录无效，未执行配置。"
+  ];
+  return allowed.includes(message) ? message : "无法写入 Codex 配置，请确认当前用户拥有本地 Codex 配置目录的访问权限。";
+}
+
+/**
+ * 将当前用户的 Codex 全局配置安全切换到本地 Gateway。
+ * @param _request 已通过本地会话校验的管理请求。
+ * @param response Express 响应对象。
+ * @returns 配置完成后的 Promise。
+ * @remarks 响应仅返回执行状态，绝不返回访问令牌、认证内容或配置文件路径。
+ */
+async function configureLocalCodex(_request: Request, response: Response): Promise<void> {
+  try {
+    response.json(await configureCodex({
+      accessToken: config.accessToken,
+      gatewayHost: "127.0.0.1",
+      gatewayPort: config.port
+    }));
+  } catch (error) {
+    response.status(400).json({ error: publicCodexConfigurationError(error) });
+  }
 }
 
 async function probe(upstream: Upstream): Promise<Probe> {
@@ -260,6 +356,7 @@ async function streamUpstreamRequest(response: Response, upstream: Upstream, mod
 
 app.get("/health", (_request, response) => response.json({ ok: true, activeUpstreamId: activeUpstreamId() }));
 app.get("/api/status", (_request, response) => response.json(publicStatus()));
+app.post("/api/codex/configure", requireLocalToken, configureLocalCodex);
 app.get("/api/upstreams", (_request, response) => response.json({ upstreams: publicStatus().upstreams }));
 app.get("/api/upstreams/:id/models", requireLocalToken, async (request, response) => {
   const id = routeId(request);
@@ -355,7 +452,7 @@ app.all("/v1/{*path}", proxyRequest);
 const webRoot = path.join(root, "dist-web");
 app.use((request, response, next) => {
   if (request.method === "GET" && !request.path.startsWith("/api") && request.path !== "/health" && !request.path.startsWith("/v1/")) {
-    response.cookie("gateway_session", sessionCookieValue(), { httpOnly: true, sameSite: "strict", secure: false, path: "/" });
+    issueSessionCookie(request, response);
   }
   next();
 });

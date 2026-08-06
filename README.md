@@ -17,7 +17,7 @@ npm start
 
 打开 http://127.0.0.1:4000，添加每个 OpenAI 兼容中转的 URL 和 API Key，测试后点击“使用此中转”。数据保存在本地 `.data/gateway.sqlite`，文件权限仅允许当前用户访问。管理 API 不会返回 API Key，嵌入式浏览器页面也无法访问它。
 
-在 Codex 中一次性配置：
+在 Codex 中配置：
 
 ```text
 Base URL: http://127.0.0.1:4000/v1
@@ -27,12 +27,15 @@ Model: 当前中转支持的任意模型名
 
 Gateway 会使用保存的上游 API Key 向中转发请求，不会将它暴露给 Codex 或浏览器。
 
+也可以在管理页“Codex 请求入口”区域点击“一键配置”。该操作不会新建或切换 `model_provider`：默认 `openai` provider 会更新 `openai_base_url`，已有自定义 provider 则在原 provider 表中更新本机 Gateway 地址，并把 `.env` 中的 `GATEWAY_ACCESS_TOKEN` 写入 Codex 的 `auth.json`。它兼容 macOS 与 Windows，使用 `CODEX_HOME`，未设置时使用当前用户目录下的 `.codex`；操作前会在本机创建带时间戳的备份。配置会保留当前模型名和其它个人设置，完成后需要重启 Codex。
+
 ## API
 
 管理接口仅监听本机。写操作需要打开管理页时创建的本地 `HttpOnly` 会话令牌 Cookie。
 
 - `GET /health`
 - `GET /api/status`
+- `POST /api/codex/configure`
 - `GET /api/upstreams`
 - `GET /api/upstreams/:id/models`
 - `POST /api/upstreams`
@@ -60,6 +63,24 @@ npm run codex
 ```
 
 它会在需要时启动本地 Gateway、使用 loopback CDP 端口启动 ChatGPT/Codex、注入“网关管理”侧栏入口，并持续处理 renderer 替换和页面重载。项目已不再使用 Docker，因此该命令不会启动 Docker。
+
+为避免 macOS 将启动参数转发给当前已打开的 ChatGPT，launcher 会直接启动 app bundle 内的可执行文件，并使用独立的持久 profile（默认 `.data/codex-cdp-profile`）。这不会影响当前 Codex 窗口；首次使用该独立窗口时需要重新登录。可通过环境变量或命令行指定 profile：
+
+```bash
+CODEX_CDP_USER_DATA_DIR=/绝对路径/到/codex-gateway-profile npm run codex
+# 或
+npm run codex -- --user-data-dir /绝对路径/到/codex-gateway-profile
+```
+
+Codex 的 renderer CSP 默认会拦截 `http://127.0.0.1:4000` iframe。launcher 会把 Gateway 的公开 HTML 作为 `blob:` 文档嵌入，启用 CDP CSP bypass、注册 document-start 注入脚本并排除头像和听写等浮层 target；后续 renderer 重建会由常驻守护自动恢复。侧栏会在“插件”下方插入“网关管理”入口；按 `Esc` 或切换到任一原生侧栏页面即可回到 Codex。
+
+当前本机安装的 ChatGPT Desktop 会在 CDP `Page.reload` 后进入“ChatGPT failed to start / ERR_FAILED (-2)”页面，因此默认不 reload 主 renderer。Taskboard 使用的 CSP bypass + reload 流程不兼容这一个 Desktop 版本。可以仅用于确认兼容性的诊断命令显式开启 reload：
+
+```bash
+npm run codex -- --force-reload
+```
+
+ChatGPT Desktop 151 还会阻止 `app://-` blob 页面访问 loopback 网络。为使 Gateway 页面能读取本机 Controller，`npm run codex` 仅为它创建的独立 profile 添加 `--disable-features=LocalNetworkAccessChecks`。这会降低该独立 profile 中网页的本地网络访问保护，因此只应在其中运行受信任的本地 Codex 内容，不能把日常浏览或不受信任网页放入这个 profile。
 
 附加到已通过其他方式启用 CDP 的实例：
 

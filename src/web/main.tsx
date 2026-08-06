@@ -19,6 +19,7 @@ import {
   RefreshCw,
   Route,
   Server,
+  Settings2,
   Trash2
 } from "lucide-react";
 import {
@@ -68,6 +69,7 @@ type Upstream = {
 };
 type Status = {
   gateway: { healthy: boolean; baseUrl: string };
+  codexConfiguration: { available: boolean };
   activeUpstream: Pick<Upstream, "id" | "name" | "apiBase"> | null;
   upstreams: Upstream[];
   notice: string;
@@ -88,7 +90,7 @@ const emptyDraft: Draft = { id: "", name: "", apiBase: "", apiKey: "" };
  * @throws 当 Controller 返回非成功状态时抛出中文错误。
  */
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, { ...init, headers: { "content-type": "application/json", ...init?.headers } });
+  const response = await fetch(url, { ...init, credentials: "include", headers: { "content-type": "application/json", ...init?.headers } });
   const data = await response.json().catch(() => ({})) as T & { error?: string };
   if (!response.ok) throw new Error(data.error ?? `请求失败（${response.status}）`);
   return data;
@@ -182,6 +184,7 @@ function App() {
   const [deleteTarget, setDeleteTarget] = useState<Upstream>();
   const [activateTarget, setActivateTarget] = useState<Upstream>();
   const [routeGuideOpen, setRouteGuideOpen] = useState(false);
+  const [codexConfigurationDialogOpen, setCodexConfigurationDialogOpen] = useState(false);
   const [busy, setBusy] = useState<string>();
   const [toastMessage, setToastMessage] = useState<ToastMessage>();
   const [testModel, setTestModel] = useState("");
@@ -194,6 +197,16 @@ function App() {
   const [testOpen, setTestOpen] = useState(false);
   const [testTarget, setTestTarget] = useState<TestTarget>();
   const [testDialogElement, setTestDialogElement] = useState<HTMLDivElement | null>(null);
+
+  /**
+   * 在嵌入式 Gateway 完成首次 React 渲染后通知 Codex 注入层。
+   * @returns 清理函数；当前无需额外清理时返回 undefined。
+   * @remarks 消息不包含会话令牌、上游凭据或 Controller 私密数据；父页面会校验 iframe 窗口与 loopback origin。
+   */
+  useEffect(() => {
+    if (window.parent === window) return;
+    window.parent.postMessage({ type: "codex-gateway:ready" }, "*");
+  }, []);
 
   /**
    * 显示统一的短暂操作反馈。
@@ -272,6 +285,19 @@ function App() {
   }
 
   /**
+   * 确认后请求 Controller 写入当前用户的 Codex 配置。
+   * @returns 无返回值。
+   * @remarks 浏览器不会接收或持有用于 auth.json 的本地 Gateway 令牌。
+   */
+  function configureCurrentCodex(): void {
+    void run("codex-configure", async () => {
+      const result = await api<{ message: string }>("/api/codex/configure", { method: "POST" });
+      setCodexConfigurationDialogOpen(false);
+      return result;
+    }, "Codex 已配置为使用本地 Gateway，请重启 Codex 后继续使用。");
+  }
+
+  /**
    * 以现有中转信息打开编辑表单。
    * @param upstream 要编辑的中转。
    * @returns 无返回值。
@@ -307,6 +333,7 @@ function App() {
         ? "/api/test-request"
         : `/api/upstreams/${testTarget.id}/test-request`;
       const response = await fetch(endpoint, {
+        credentials: "include",
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ model: testModel, prompt: testPrompt, stream: true })
@@ -398,33 +425,7 @@ function App() {
     <TooltipProvider>
       <main className="min-h-screen bg-background px-4 py-5 text-foreground sm:px-7 sm:py-7">
         <div className="mx-auto max-w-7xl">
-          <header className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">Codex</span>
-              <span aria-hidden="true" className="h-4 w-px bg-border" />
-              <h1 className="text-base font-semibold tracking-normal">Gateway</h1>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <Badge className={cn("gap-1.5 border-0 px-2.5 py-1", gatewayOnline ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700")} variant="secondary">
-                <span className={cn("size-1.5 rounded-full", gatewayOnline ? "bg-emerald-500" : "bg-destructive")} />
-                {gatewayOnline ? "网关运行中" : "网关状态未知"}
-              </Badge>
-              <Button onClick={() => setRouteGuideOpen(true)} size="sm" variant="ghost">
-                <CircleHelp className="size-3.5" aria-hidden="true" />
-                路由说明
-              </Button>
-              <Button onClick={() => void refresh()} size="sm" variant="outline">
-                <RefreshCw className="size-3.5" aria-hidden="true" />
-                刷新状态
-              </Button>
-              <Button onClick={openCreate} size="sm">
-                <Plus className="size-4" aria-hidden="true" />
-                添加中转
-              </Button>
-            </div>
-          </header>
-
-          <section aria-labelledby="route-title" className="relative mt-7 overflow-hidden rounded-[20px] bg-[#292d58] px-5 py-6 text-white shadow-[0_16px_32px_rgb(40_44_84/16%)] sm:px-7 sm:py-7">
+          <section aria-labelledby="route-title" className="relative overflow-hidden rounded-[20px] bg-[#292d58] px-5 py-6 text-white shadow-[0_16px_32px_rgb(40_44_84/16%)] sm:px-7 sm:py-7">
             <div aria-hidden="true" className="absolute -top-14 right-[22%] size-40 rounded-full border border-white/10 bg-white/5" />
             <div aria-hidden="true" className="absolute -right-10 -bottom-16 size-52 rounded-full bg-[#7d7cf6]/25 blur-2xl" />
             <div className="relative grid gap-6 lg:grid-cols-[minmax(0,1fr)_auto_minmax(280px,0.9fr)] lg:items-center">
@@ -440,7 +441,10 @@ function App() {
               </div>
               <div className="hidden items-center gap-2 text-indigo-200 lg:flex"><span className="grid size-9 place-items-center rounded-full border border-white/15 bg-white/8"><Server className="size-4" /></span><ArrowRight className="size-4" /><span className="grid size-9 place-items-center rounded-full border border-white/15 bg-white/8"><Network className="size-4" /></span></div>
               <div className="rounded-xl border border-white/12 bg-white/8 p-4 backdrop-blur-sm">
-                <div className="flex items-center gap-2 text-xs text-indigo-100/70"><Activity className="size-3.5" />Codex 请求入口</div>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-2 text-xs text-indigo-100/70"><Activity className="size-3.5 shrink-0" />Codex 请求入口</div>
+                  <Tooltip><TooltipTrigger asChild><Button aria-label="一键配置当前机器的 Codex" className="shrink-0" disabled={!status?.codexConfiguration.available || Boolean(busy)} onClick={() => setCodexConfigurationDialogOpen(true)} size="sm" type="button" variant="secondary"><Settings2 />一键配置</Button></TooltipTrigger><TooltipContent>{status?.codexConfiguration.available ? "配置当前机器的 Codex" : "请先设置 GATEWAY_ACCESS_TOKEN"}</TooltipContent></Tooltip>
+                </div>
                 <p className="mt-2 truncate font-mono text-sm font-medium">{status?.gateway.baseUrl ?? "http://127.0.0.1:4000"}/v1</p>
                 <p className="mt-2 text-xs leading-5 text-indigo-100/70">模型名、请求体与 SSE 响应均原样透传。</p>
               </div>
@@ -472,7 +476,24 @@ function App() {
                 <h2 className="mt-1 text-xl font-semibold">中转节点</h2>
                 <p className="mt-1 text-sm text-muted-foreground">选择一个节点作为当前路由，其他节点仍可独立检查和测试。</p>
               </div>
-              {activeUpstream && <Button onClick={() => void openTest(activeUpstream)} size="sm" variant="secondary"><FlaskConical className="size-3.5" />测试当前中转</Button>}
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge className={cn("gap-1.5 border-0 px-2.5 py-1", gatewayOnline ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700")} variant="secondary">
+                  <span className={cn("size-1.5 rounded-full", gatewayOnline ? "bg-emerald-500" : "bg-destructive")} />
+                  {gatewayOnline ? "网关运行中" : "网关状态未知"}
+                </Badge>
+                <Button onClick={() => setRouteGuideOpen(true)} size="sm" variant="ghost">
+                  <CircleHelp className="size-3.5" aria-hidden="true" />
+                  路由说明
+                </Button>
+                <Button onClick={() => void refresh()} size="sm" variant="outline">
+                  <RefreshCw className="size-3.5" aria-hidden="true" />
+                  刷新状态
+                </Button>
+                <Button onClick={openCreate} size="sm">
+                  <Plus className="size-4" aria-hidden="true" />
+                  添加中转
+                </Button>
+              </div>
             </div>
             <section aria-label="中转列表" className="mt-4 grid gap-3">
               {upstreams.length === 0 && <div className="rounded-2xl border border-dashed border-border bg-card py-16 text-center shadow-[0_4px_14px_rgb(25_34_68/4%)]">
@@ -534,6 +555,24 @@ function App() {
             <Button disabled={Boolean(busy)} type="submit">{busy?.startsWith("edit-") || busy === "create" ? <LoaderCircle className="animate-spin" /> : <Check />}{editing ? "保存更改" : "添加中转"}</Button>
           </DialogFooter>
         </form>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog onOpenChange={(open) => { if (open || busy !== "codex-configure") setCodexConfigurationDialogOpen(open); }} open={codexConfigurationDialogOpen}>
+      <DialogContent className="grid max-h-[calc(100vh-2rem)] gap-0 overflow-hidden p-0 sm:max-w-lg" showCloseButton={busy !== "codex-configure"}>
+        <DialogHeader className="border-b border-border px-5 py-4 pr-12 sm:px-6">
+          <DialogTitle>配置当前机器的 Codex</DialogTitle>
+          <DialogDescription>将 Codex 的全局请求入口切换到本机 Gateway。</DialogDescription>
+        </DialogHeader>
+        <div className="min-h-0 overflow-y-auto px-5 py-5 text-sm leading-6 text-muted-foreground sm:px-6">
+          <p>当前模型名会保留并原样转发；其它个人配置不会被覆盖。</p>
+          <p className="mt-3">现有 <code className="font-mono text-xs text-foreground">config.toml</code> 和 <code className="font-mono text-xs text-foreground">auth.json</code> 会先在本机创建备份。本地访问令牌不会发送到页面。</p>
+          <p className="mt-3 text-foreground">完成后请重启 Codex，使新配置生效。</p>
+        </div>
+        <DialogFooter className="border-t border-border bg-secondary/45 px-5 py-4 sm:px-6">
+          <Button disabled={busy === "codex-configure"} onClick={() => setCodexConfigurationDialogOpen(false)} type="button" variant="outline">取消</Button>
+          <Button disabled={busy === "codex-configure"} onClick={configureCurrentCodex} type="button">{busy === "codex-configure" ? <LoaderCircle className="animate-spin" /> : <Settings2 />}确认配置</Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
 

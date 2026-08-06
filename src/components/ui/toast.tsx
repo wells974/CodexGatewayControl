@@ -43,8 +43,8 @@ function Toast({
 }: React.ComponentProps<typeof ToastPrimitive.Root> & { variant?: "default" | "destructive" }) {
   return <ToastPrimitive.Root
     className={cn(
-      "group pointer-events-auto relative grid w-full grid-cols-[auto_1fr_auto] gap-x-3 overflow-hidden rounded-md border border-border bg-secondary p-4 text-secondary-foreground shadow-lg transition-all data-[state=closed]:animate-out data-[state=closed]:fade-out-80 data-[state=closed]:slide-out-to-top-full data-[state=open]:animate-in data-[state=open]:slide-in-from-top-full",
-      variant === "destructive" && "border-destructive/35 bg-destructive/10 text-foreground",
+      "group pointer-events-auto relative grid w-full grid-cols-[auto_1fr_auto] gap-x-3 overflow-hidden rounded-xl border border-border bg-card p-4 text-foreground shadow-[0_12px_30px_rgb(25_34_68/14%)] transition-all data-[state=closed]:animate-out data-[state=closed]:fade-out-80 data-[state=closed]:slide-out-to-top-full data-[state=open]:animate-in data-[state=open]:slide-in-from-top-full",
+      variant === "destructive" && "border-destructive/45",
       className
     )}
     data-slot="toast"

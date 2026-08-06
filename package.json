@@ -12,14 +12,16 @@
     "dev:web": "vite --host 127.0.0.1",
     "build": "tsc -p tsconfig.json && vite build",
     "start": "node dist-controller/controller/index.js",
-    "inject": "npm run codex:attach",
+    "inject": "npm run codex",
     "codex": "npm run build && node scripts/codex-gateway.mjs --launch --watch --open",
     "gateway:codex": "npm run codex",
     "codex:attach": "npm run build && node scripts/codex-gateway.mjs --attach-existing --watch --open",
-    "gateway": "npm start"
+    "gateway": "npm start",
+    "test": "tsx --test src/controller/codex-config.test.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
+    "@iarna/toml": "^2.2.5",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
