@@ -9,7 +9,7 @@
 ## 技术栈
 
 - 运行时固定为 Node.js 22+ 与 TypeScript。
-- Controller 使用 Express 5；SQLite 使用 Node 内置 `node:sqlite`。不引入 Docker、LiteLLM、Postgres 或远程数据库。
+- Controller 使用 Express 5；SQLite 使用 Node 内置 `node:sqlite`。
 - Web 使用 React 19、Vite 6、Tailwind CSS v4（`@tailwindcss/vite`）和 shadcn/ui。
 - 通过 shadcn CLI 添加 `Dialog`、`Popover`、`Command`、`Select` 等组件；其内部的 Radix 依赖由 shadcn 管理，不在业务组件中直接拼装 Radix 原语。图标使用 `lucide-react`。
 - 不引入 Ant Design、MUI 或其他完整 UI 设计系统，也不平行维护第二套组件库。
