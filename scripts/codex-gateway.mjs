@@ -29,13 +29,13 @@ function parseArgs(argv) {
     else if (arg === "--open") options.open = true;
     else if (arg === "--port") options.port = Number(argv[++index]);
     else if (arg === "--app-path") options.appPath = path.resolve(argv[++index]);
-    else throw new Error(`Unknown option: ${arg}`);
+    else throw new Error(`未知选项：${arg}`);
   }
   if (!Number.isInteger(options.port) || options.port < 1024 || options.port > 65535) {
-    throw new Error("--port must be an integer from 1024 to 65535");
+    throw new Error("--port 必须是 1024 到 65535 之间的整数");
   }
   if (options.launch && options.attachExisting) {
-    throw new Error("Use either --launch or --attach-existing, not both");
+    throw new Error("请只使用 --launch 或 --attach-existing 其中之一");
   }
   if (!options.launch && !options.attachExisting) options.launch = true;
   return options;
@@ -56,7 +56,7 @@ async function waitFor(url, timeoutMs, label) {
     if (await reachable(url)) return;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  throw new Error(`Timed out waiting for ${label}`);
+  throw new Error(`等待${label}超时`);
 }
 
 function run(command, args, options = {}) {
@@ -70,16 +70,16 @@ function run(command, args, options = {}) {
 function startController() {
   const entry = path.join(root, "dist-controller", "controller", "index.js");
   const child = spawn(process.execPath, [entry], { cwd: root, stdio: "inherit" });
-  child.once("error", (error) => console.error(`Controller process error: ${error.message}`));
+  child.once("error", (error) => console.error(`Controller 进程错误：${error.message}`));
   return child;
 }
 
 async function ensureController() {
   if (await reachable(`${controllerUrl}/health`)) return { child: null, started: false };
-  console.log("Starting local Gateway Controller...");
+  console.log("正在启动本地 Gateway Controller...");
   const child = startController();
   try {
-    await waitFor(`${controllerUrl}/health`, 15_000, "Gateway Controller");
+    await waitFor(`${controllerUrl}/health`, 15_000, "Gateway Controller 服务");
     return { child, started: true };
   } catch (error) {
     child.kill("SIGTERM");
@@ -88,7 +88,7 @@ async function ensureController() {
 }
 
 function launchCodex(appPath, port) {
-  console.log(`Launching a separate Gateway-enabled Codex instance on CDP port ${port}...`);
+  console.log(`正在 CDP 端口 ${port} 启动独立的 Gateway-enabled Codex 实例...`);
   return spawn("/usr/bin/open", [
     "-n", "-a", appPath, "--args",
     `--remote-debugging-port=${port}`,
@@ -109,7 +109,7 @@ class CdpConnection {
   async open() {
     await new Promise((resolve, reject) => {
       this.socket.once("open", resolve);
-      this.socket.once("error", () => reject(new Error("CDP WebSocket connection failed")));
+      this.socket.once("error", () => reject(new Error("CDP WebSocket 连接失败")));
     });
     this.socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString());
@@ -118,7 +118,7 @@ class CdpConnection {
         this.waiters.delete(message.method);
         waiters.forEach((waiter) => waiter.resolve(message.params));
         for (const handler of this.handlers.get(message.method) || []) {
-          Promise.resolve(handler(message.params)).catch((error) => console.error(`CDP ${message.method}: ${error.message}`));
+          Promise.resolve(handler(message.params)).catch((error) => console.error(`CDP ${message.method} 错误：${error.message}`));
         }
         return;
       }
@@ -130,7 +130,7 @@ class CdpConnection {
     });
     this.socket.on("close", () => {
       this.closed = true;
-      const error = new Error("CDP WebSocket closed");
+      const error = new Error("CDP WebSocket 已关闭");
       this.pending.forEach((pending) => pending.reject(error));
       this.pending.clear();
       this.handlers.clear();
@@ -140,7 +140,7 @@ class CdpConnection {
   }
 
   send(method, params = {}) {
-    if (this.closed) return Promise.reject(new Error("CDP connection is closed"));
+    if (this.closed) return Promise.reject(new Error("CDP 连接已关闭"));
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
@@ -175,7 +175,7 @@ class CdpConnection {
 
 async function cdpTargets(port) {
   const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2_000) });
-  if (!response.ok) throw new Error(`CDP target discovery returned ${response.status}`);
+  if (!response.ok) throw new Error(`CDP target 发现请求返回 ${response.status}`);
   const targets = await response.json();
   return targets.filter((target) => target.type === "page" && target.webSocketDebuggerUrl && (
     target.url?.startsWith("app://") || target.url?.startsWith("codex://") || /codex|chatgpt/i.test(target.title || "")
@@ -191,7 +191,7 @@ async function waitForCodexTarget(port, timeoutMs) {
     } catch (_) {}
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  throw new Error(`No Codex renderer target appeared on CDP port ${port}`);
+  throw new Error(`CDP 端口 ${port} 上未出现 Codex renderer target`);
 }
 
 async function currentSource() {
@@ -240,12 +240,12 @@ async function waitForStatus(cdp, sourceHash, shouldOpen, timeoutMs) {
     if (ready && frameReady) return status;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  throw new Error("Gateway entry or iframe did not mount in the Codex renderer");
+  throw new Error("Gateway 入口或 iframe 未能挂载到 Codex renderer");
 }
 
 async function evaluate(cdp, source) {
   const result = await cdp.send("Runtime.evaluate", { expression: source, awaitPromise: true, returnByValue: true });
-  if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Gateway injection failed");
+  if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Gateway 注入失败");
 }
 
 async function replaceDocumentScript(cdp, state, source) {
@@ -285,13 +285,13 @@ async function injectTarget(target, source, hash, shouldOpen, states) {
   if (shouldOpen) await cdp.send("Runtime.evaluate", { expression: "window.__codexGatewayInjection__?.open()", returnByValue: true });
   const status = await waitForStatus(cdp, hash, shouldOpen, 15_000);
   const frameLoaded = shouldOpen ? await waitForFrame(cdp, status.frameUrl, 15_000) : false;
-  if (shouldOpen && !frameLoaded) throw new Error("Gateway iframe element mounted but its frame did not load");
+  if (shouldOpen && !frameLoaded) throw new Error("Gateway iframe 元素已挂载，但其 frame 未完成加载");
   return { targetId: target.id, title: target.title, url: target.url, cspBypassed: true, frameLoaded, ...status };
 }
 
 async function reconcile(port, source, hash, shouldOpen, states) {
   const targets = await cdpTargets(port);
-  if (!targets.length) throw new Error("No Codex renderer target found");
+  if (!targets.length) throw new Error("未找到 Codex renderer target");
   const activeIds = new Set(targets.map((target) => target.id));
   for (const [id, state] of states) {
     if (!activeIds.has(id) || state.cdp.closed) {
@@ -321,7 +321,7 @@ async function main() {
     stopping = true;
     states.forEach((state) => state.cdp.close());
     if (controller?.started && controller.child?.exitCode === null) controller.child.kill("SIGTERM");
-    // No external services are owned by this launcher.
+    // 此启动器不管理任何外部服务。
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
@@ -330,7 +330,7 @@ async function main() {
     controller = await ensureController();
     const cdpAvailable = await reachable(cdpVersion);
     if (options.attachExisting && !cdpAvailable) {
-      throw new Error(`Cannot attach: Codex CDP is not listening on 127.0.0.1:${options.port}. Start Codex with --remote-debugging-port=${options.port}, or use npm run codex for a separate Gateway-enabled instance.`);
+      throw new Error(`无法附加：Codex CDP 未监听 127.0.0.1:${options.port}。请使用 --remote-debugging-port=${options.port} 启动 Codex，或运行 npm run codex 创建独立的 Gateway-enabled 实例。`);
     }
     if (!cdpAvailable && options.launch) {
       launchCodex(options.appPath, options.port);
@@ -353,7 +353,7 @@ async function main() {
         const results = await reconcile(options.port, latest.source, latest.hash, false, states);
         if (results.length) console.log(JSON.stringify({ reconciled: results }, null, 2));
       } catch (error) {
-        if (!stopping) console.error(`Gateway launcher waiting for Codex: ${error.message}`);
+        if (!stopping) console.error(`Gateway 启动器正在等待 Codex：${error.message}`);
       }
     }
   } finally {

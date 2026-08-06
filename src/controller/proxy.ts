@@ -23,12 +23,12 @@ function requestHeaders(request: Request, apiKey: string): Headers {
 
 export async function proxyRequest(request: Request, response: Response): Promise<void> {
   if (!authorized(request)) {
-    response.status(401).json({ error: { message: "Invalid local Gateway API key", type: "authentication_error" } });
+    response.status(401).json({ error: { message: "本地 Gateway API Key 无效", type: "authentication_error" } });
     return;
   }
   const upstream = activeUpstream();
   if (!upstream) {
-    response.status(503).json({ error: { message: "No active upstream selected in Codex Gateway Control", type: "gateway_error" } });
+    response.status(503).json({ error: { message: "尚未在 Codex Gateway Control 中选择当前中转", type: "gateway_error" } });
     return;
   }
   const url = new URL(request.originalUrl, `${upstream.apiBase.replace(/\/$/, "")}/`);
@@ -37,7 +37,7 @@ export async function proxyRequest(request: Request, response: Response): Promis
       method: request.method,
       headers: requestHeaders(request, upstream.apiKey),
       body: ["GET", "HEAD"].includes(request.method) ? undefined : request,
-      // Node requires this for a streamed request body.
+      // Node 对流式请求体要求显式声明 duplex。
       duplex: "half",
       signal: AbortSignal.timeout(10 * 60_000)
     } as RequestInit);
@@ -48,6 +48,6 @@ export async function proxyRequest(request: Request, response: Response): Promis
     if (!upstreamResponse.body) { response.end(); return; }
     Readable.fromWeb(upstreamResponse.body as import("node:stream/web").ReadableStream).pipe(response);
   } catch (error) {
-    response.status(502).json({ error: { message: `Upstream ${upstream.name} is unavailable: ${error instanceof Error ? error.message : String(error)}`, type: "gateway_error" } });
+    response.status(502).json({ error: { message: `中转 ${upstream.name} 不可用：${error instanceof Error ? error.message : String(error)}`, type: "gateway_error" } });
   }
 }

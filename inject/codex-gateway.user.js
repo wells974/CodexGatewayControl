@@ -61,12 +61,12 @@
     button.removeAttribute("aria-controls");
     button.removeAttribute("data-state");
     button.setAttribute(OWNED, "true");
-    button.setAttribute("aria-label", "Open Gateway");
-    button.title = "Gateway";
+    button.setAttribute("aria-label", "打开网关管理");
+    button.title = "网关管理";
     button.querySelectorAll?.("[id]").forEach((node) => node.removeAttribute("id"));
     const label = button.querySelector?.(".text-fade-truncate") || button.querySelector?.("span");
-    if (label) label.textContent = "Gateway";
-    else button.textContent = "Gateway";
+    if (label) label.textContent = "网关管理";
+    else button.textContent = "网关管理";
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -103,10 +103,10 @@
     section.hidden = true;
     section.setAttribute(OWNED, "true");
     section.setAttribute("role", "region");
-    section.setAttribute("aria-label", "Codex Gateway Control");
+    section.setAttribute("aria-label", "Codex 网关管理");
     const close = document.createElement("button");
     close.type = "button";
-    close.textContent = "Close";
+    close.textContent = "关闭";
     close.setAttribute("data-gateway-close", "true");
     close.addEventListener("click", closeGateway);
     section.appendChild(close);
@@ -117,7 +117,7 @@
     frame?.remove();
     frame = document.createElement("iframe");
     frame.id = FRAME_ID;
-    frame.title = "Codex Gateway Control";
+    frame.title = "Codex 网关管理";
     frame.referrerPolicy = "no-referrer";
     frame.src = GATEWAY_URL;
     frame.addEventListener("load", () => frame?.setAttribute("data-gateway-frame-loaded", "true"));
