@@ -17,6 +17,8 @@ npm start
 
 打开 http://127.0.0.1:4000，添加每个 OpenAI 兼容中转的 URL 和 API Key，测试后点击“使用此中转”。数据保存在本地 `.data/gateway.sqlite`，文件权限仅允许当前用户访问。管理 API 不会返回 API Key，嵌入式浏览器页面也无法访问它。
 
+Codex 内嵌管理页使用独立的 HTTPS loopback 地址 `https://127.0.0.1:4401`。这是为了让 `blob:app://-` iframe 能使用浏览器自动携带的 `HttpOnly; Secure; Partitioned` 本地会话 Cookie；模型代理地址仍固定为 HTTP `http://127.0.0.1:4000`。首次启动会在 `.data/` 生成仅本机使用的自签名证书和私钥，二者均不会提交或发送到浏览器页面。
+
 在 Codex 中配置：
 
 ```text
@@ -80,13 +82,15 @@ Codex 的 renderer CSP 默认会拦截 `http://127.0.0.1:4000` iframe。launcher
 npm run codex -- --force-reload
 ```
 
-ChatGPT Desktop 151 还会阻止 `app://-` blob 页面访问 loopback 网络。为使 Gateway 页面能读取本机 Controller，`npm run codex` 仅为它创建的独立 profile 添加 `--disable-features=LocalNetworkAccessChecks`。这会降低该独立 profile 中网页的本地网络访问保护，因此只应在其中运行受信任的本地 Codex 内容，不能把日常浏览或不受信任网页放入这个 profile。
+ChatGPT Desktop 151 还会阻止 `app://-` blob 页面访问 loopback 网络。为使 Gateway 页面能读取 Controller 且保持 `HttpOnly` 会话，`npm run codex` 仅为它创建的独立 profile 关闭本地网络检查，并以证书的原始 SPKI SHA-256 base64 指纹精确放行本机 Gateway HTTPS 证书；不会使用全局忽略 HTTPS 证书错误的参数。这会降低该独立 profile 中网页的本地网络访问保护，因此只应在其中运行受信任的本地 Codex 内容，不能把日常浏览或不受信任网页放入这个 profile。
 
 附加到已通过其他方式启用 CDP 的实例：
 
 ```bash
 npm run codex:attach -- --port 9222
 ```
+
+推荐始终使用 `npm run inject`（等同于 `npm run codex`），因为它会创建带本机 HTTPS 证书 SPKI 白名单的专用 profile。`attach-existing` 不会、也不能修改已运行 Codex 的启动参数；只有目标实例已在启动时同时配置 loopback CDP、本地网络访问和该证书的 SPKI 白名单时，嵌入管理页的安全会话才可用。普通现有 Codex 窗口不满足这些条件时，请改用推荐命令启动独立实例。
 
 如果选定端口不是存活的 Codex CDP endpoint，附加模式会明确报错。CDP 是未认证的 loopback 调试接口，只应在运行受信任本地代码时启用。本项目尚未提供已签名的 macOS companion app、Keychain 集成或 Notarization。
 

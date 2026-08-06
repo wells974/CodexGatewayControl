@@ -1,5 +1,8 @@
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import express, { type NextFunction, type Request, type Response } from "express";
+import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import https from "node:https";
 import { config, sessionCookieValue } from "./config.js";
 import {
   activeUpstream,
@@ -25,6 +28,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const app = express();
 app.disable("x-powered-by");
 const codexEmbedOrigin = "app://-";
+const tlsKeyPath = path.join(config.dataDir, "gateway-ui-key.pem");
+const tlsCertificatePath = path.join(config.dataDir, "gateway-ui-cert.pem");
 
 /**
  * 判断请求来源是否是本机管理页或受支持的 Codex blob 嵌入页。
@@ -33,7 +38,7 @@ const codexEmbedOrigin = "app://-";
  * @remarks 不接受任意 Origin，避免将本地管理接口暴露给其他网页。
  */
 function isAllowedControllerOrigin(origin: string | undefined): boolean {
-  return !origin || /^http:\/\/127\.0\.0\.1(?::\d+)?$/.test(origin) || origin === codexEmbedOrigin;
+  return !origin || /^https?:\/\/127\.0\.0\.1(?::\d+)?$/.test(origin) || origin === codexEmbedOrigin;
 }
 
 /**
@@ -66,7 +71,7 @@ function allowCodexEmbedCors(request: Request, response: Response, next: NextFun
  * @param request Express 请求对象，用于识别普通浏览器或 Codex blob 嵌入页。
  * @param response Express 响应对象。
  * @returns 无返回值。
- * @remarks 嵌入页使用 `SameSite=None; Secure` 以支持受限跨 origin 请求；Cookie 值不会进入 HTML、CDP 或日志。
+ * @remarks HTTPS 嵌入页使用 CHIPS `Partitioned; SameSite=None; Secure` Cookie，将会话绑定到 `app://-` 顶级站点；Cookie 值不会进入 HTML、CDP 或日志。
  */
 function issueSessionCookie(request: Request, response: Response): void {
   const embedded = request.header("origin") === codexEmbedOrigin;
@@ -74,6 +79,7 @@ function issueSessionCookie(request: Request, response: Response): void {
     httpOnly: true,
     sameSite: embedded ? "none" : "strict",
     secure: embedded,
+    partitioned: embedded,
     path: "/"
   });
 }
@@ -354,7 +360,17 @@ async function streamUpstreamRequest(response: Response, upstream: Upstream, mod
 }
 
 app.get("/health", (_request, response) => response.json({ ok: true, activeUpstreamId: activeUpstreamId() }));
-app.get("/api/status", (_request, response) => response.json(publicStatus()));
+/**
+ * 返回公开网关状态，并在嵌入页首次带凭据读取时建立本地管理会话。
+ * @param request Express 请求对象，用于区分 Codex blob 嵌入页与普通本地页面。
+ * @param response Express 响应对象。
+ * @returns 无返回值。
+ * @remarks 该接口不返回会话令牌；浏览器仅从 `Set-Cookie` 接收 HttpOnly Cookie，后续写请求会自动携带它。
+ */
+app.get("/api/status", (request, response) => {
+  issueSessionCookie(request, response);
+  response.json(publicStatus());
+});
 app.post("/api/codex/configure", requireLocalToken, configureLocalCodex);
 app.get("/api/upstreams", (_request, response) => response.json({ upstreams: publicStatus().upstreams }));
 app.get("/api/upstreams/:id/models", requireLocalToken, async (request, response) => {
@@ -458,4 +474,51 @@ app.use((request, response, next) => {
 app.use(express.static(webRoot));
 app.get("/{*path}", (_request, response) => response.sendFile(path.join(webRoot, "index.html")));
 
-app.listen(config.port, config.host, () => console.log(`Codex Gateway 已监听 http://${config.host}:${config.port}`));
+/**
+ * 创建或读取仅供本机 Gateway 管理页使用的 TLS 证书。
+ * @returns HTTPS 服务所需的私钥和证书文本。
+ * @throws 系统缺少 openssl、证书生成失败或生成后的文件无法读取时抛出错误。
+ * @remarks 证书和私钥仅存于本地 `.data`；模型代理仍使用 HTTP loopback，不会使用此证书。
+ */
+function gatewayTlsCredentials(): { key: Buffer; cert: Buffer } {
+  mkdirSync(config.dataDir, { recursive: true });
+  if (!existsSync(tlsKeyPath) || !existsSync(tlsCertificatePath)) {
+    execFileSync("openssl", [
+      "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+      "-keyout", tlsKeyPath,
+      "-out", tlsCertificatePath,
+      "-sha256", "-days", "3650",
+      "-subj", "/CN=127.0.0.1",
+      "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"
+    ], { stdio: "ignore" });
+  }
+  chmodSync(tlsKeyPath, 0o600);
+  chmodSync(tlsCertificatePath, 0o600);
+  return { key: readFileSync(tlsKeyPath), cert: readFileSync(tlsCertificatePath) };
+}
+
+const tlsCredentials = gatewayTlsCredentials();
+const httpServer = app.listen(config.port, config.host, () => console.log(`Codex Gateway 代理已监听 http://${config.host}:${config.port}`));
+const httpsServer = https.createServer(tlsCredentials, app).listen(config.uiTlsPort, config.host, () => {
+  console.log(`Codex Gateway 管理页已监听 https://${config.host}:${config.uiTlsPort}`);
+});
+
+/**
+ * 在任一本地监听端口不可用时关闭另一服务并退出，避免留下半可用 Controller。
+ * @param protocol 发生错误的监听协议名称。
+ * @returns 无返回值。
+ * @remarks 不输出底层路径、请求令牌或其他私密配置；启动器可据此报告明确的本地端口冲突。
+ */
+function failOnListenError(protocol: "HTTP" | "HTTPS"): (error: NodeJS.ErrnoException) => void {
+  return (error) => {
+    const port = protocol === "HTTP" ? config.port : config.uiTlsPort;
+    const reason = error.code === "EADDRINUSE" ? "端口已被其他本地程序占用" : "无法绑定本地端口";
+    console.error(`Codex Gateway ${protocol} 启动失败：127.0.0.1:${port} ${reason}。`);
+    httpServer.close();
+    httpsServer.close();
+    process.exitCode = 1;
+  };
+}
+
+httpServer.once("error", failOnListenError("HTTP"));
+httpsServer.once("error", failOnListenError("HTTPS"));

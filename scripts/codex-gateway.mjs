@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
+import { createHash, X509Certificate } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, readFile } from "node:fs/promises";
+import https from "node:https";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import WebSocket from "ws";
@@ -10,6 +11,8 @@ import WebSocket from "ws";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const defaultPort = Number(process.env.CODEX_CDP_PORT ?? 9237);
 const controllerUrl = process.env.GATEWAY_ORIGIN ?? "http://127.0.0.1:4000";
+const gatewayUiOrigin = process.env.GATEWAY_UI_ORIGIN ?? `https://127.0.0.1:${Number(process.env.GATEWAY_UI_TLS_PORT ?? 4401)}`;
+const gatewayTlsCertificatePath = path.join(path.resolve(process.env.GATEWAY_DATA_DIR ?? ".data"), "gateway-ui-cert.pem");
 const injectionPath = path.join(root, "inject", "codex-gateway.user.js");
 
 function parseArgs(argv) {
@@ -55,10 +58,53 @@ async function reachable(url, timeoutMs = 1_500) {
   }
 }
 
+/**
+ * 检查 Gateway 本机 HTTPS 管理页是否可达。
+ * @param {string} url 仅指向本机 HTTPS 管理页的健康检查地址。
+ * @param {number} timeoutMs 单次连接的超时时间。
+ * @returns {Promise<boolean>} 收到成功 HTTP 响应时返回 true。
+ * @remarks 仅对 loopback 自签名证书关闭本次 Node 健康检查的证书验证；不会改变 Desktop 或系统的 TLS 策略。
+ */
+async function reachableGatewayUi(url, timeoutMs = 1_500) {
+  const endpoint = new URL(url);
+  if (endpoint.protocol !== "https:" || endpoint.hostname !== "127.0.0.1") return false;
+  return new Promise((resolve) => {
+    const request = https.get({
+      hostname: endpoint.hostname,
+      port: endpoint.port,
+      path: `${endpoint.pathname}${endpoint.search}`,
+      rejectUnauthorized: false,
+      timeout: timeoutMs
+    }, (response) => {
+      response.resume();
+      resolve(Boolean(response.statusCode && response.statusCode >= 200 && response.statusCode < 400));
+    });
+    request.once("timeout", () => request.destroy());
+    request.once("error", () => resolve(false));
+  });
+}
+
 async function waitFor(url, timeoutMs, label) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await reachable(url)) return;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`等待${label}超时`);
+}
+
+/**
+ * 等待 Gateway 本机 HTTPS 管理页可达。
+ * @param {string} url 管理页健康检查地址。
+ * @param {number} timeoutMs 最大等待时间。
+ * @param {string} label 面向用户的服务名称。
+ * @returns {Promise<void>} 服务可达时完成。
+ * @throws 超过最大等待时间仍未收到成功响应时抛出错误。
+ */
+async function waitForGatewayUi(url, timeoutMs, label) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await reachableGatewayUi(url)) return;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`等待${label}超时`);
@@ -80,15 +126,37 @@ function startController() {
 }
 
 async function ensureController() {
-  if (await reachable(`${controllerUrl}/health`)) return { child: null, started: false };
+  const proxyHealthy = await reachable(`${controllerUrl}/health`);
+  const uiHealthy = await reachableGatewayUi(`${gatewayUiOrigin}/health`);
+  if (proxyHealthy && uiHealthy) return { child: null, started: false };
+  if (proxyHealthy) {
+    throw new Error(`Gateway HTTP 代理可达，但 HTTPS 管理页 ${gatewayUiOrigin} 不可达。请停止旧 Controller 后重新运行 npm run codex。`);
+  }
   console.log("正在启动本地 Gateway Controller...");
   const child = startController();
   try {
     await waitFor(`${controllerUrl}/health`, 15_000, "Gateway Controller 服务");
+    await waitForGatewayUi(`${gatewayUiOrigin}/health`, 15_000, "Gateway HTTPS 管理页");
     return { child, started: true };
   } catch (error) {
     child.kill("SIGTERM");
     throw error;
+  }
+}
+
+/**
+ * 计算本地 Gateway HTTPS 证书的 SPKI 指纹，供独立 Codex 精确放行该证书。
+ * @returns {Promise<string>} 以 base64 编码的 SHA-256 SPKI 指纹。
+ * @throws Controller 尚未生成证书或证书格式无效时抛出错误。
+ * @remarks 只读取公开证书，不读取私钥、Controller 令牌或上游凭据。
+ */
+async function gatewayTlsSpki() {
+  try {
+    const certificate = new X509Certificate(await readFile(gatewayTlsCertificatePath));
+    const publicKey = certificate.publicKey.export({ type: "spki", format: "der" });
+    return createHash("sha256").update(publicKey).digest("base64");
+  } catch {
+    throw new Error("未找到 Gateway 本地 HTTPS 证书。请重启 Controller 后重试。");
   }
 }
 
@@ -109,17 +177,19 @@ function desktopExecutable(appPath) {
  * @param {string} userDataDir 独立实例的持久用户数据目录。
  * @returns {Promise<import("node:child_process").ChildProcess>} 已启动的 Desktop 主进程。
  * @throws 创建 profile 目录失败时抛出文件系统错误。
- * @remarks `LocalNetworkAccessChecks` 仅为隔离 profile 关闭，以允许 blob Gateway 页面请求本机 Controller；不得用当前日常 Codex profile 启动该实例。
+ * @remarks 仅为隔离 profile 关闭本地网络检查，并只信任 Gateway 证书的精确 SPKI 指纹；不得用当前日常 Codex profile 启动该实例。
  */
 async function launchCodex(appPath, port, userDataDir) {
   await mkdir(userDataDir, { recursive: true });
+  const tlsSpki = await gatewayTlsSpki();
   console.log(`正在 CDP 端口 ${port} 启动独立的 Gateway-enabled Codex 实例...`);
   console.log(`独立 Codex profile：${userDataDir}`);
   const child = spawn(desktopExecutable(appPath), [
     `--user-data-dir=${userDataDir}`,
     `--remote-debugging-port=${port}`,
     `--remote-allow-origins=http://127.0.0.1:${port}`,
-    "--disable-features=LocalNetworkAccessChecks"
+    "--disable-features=LocalNetworkAccessChecks",
+    `--ignore-certificate-errors-spki-list=${tlsSpki}`
   ], { stdio: "ignore", detached: true });
   child.unref();
   return child;
@@ -271,7 +341,7 @@ async function currentSource() {
   if (!pageResponse.ok) throw new Error(`读取 Gateway 公开页面失败：HTTP ${pageResponse.status}`);
   const pageHtml = await pageResponse.text();
   const runtime = [
-    `window.__CODEX_GATEWAY_URL__ = ${JSON.stringify(`${controllerUrl}/`)};`,
+    `window.__CODEX_GATEWAY_URL__ = ${JSON.stringify(`${gatewayUiOrigin}/`)};`,
     `window.__CODEX_GATEWAY_BLOB_HTML__ = ${JSON.stringify(pageHtml)};`,
     userSource
   ].join("\n");
