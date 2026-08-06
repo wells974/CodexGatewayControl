@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "concurrently -k \"npm:dev:controller\" \"npm:dev:web\"",
     "dev:controller": "tsx watch src/controller/index.ts",
@@ -17,22 +19,28 @@
     "gateway": "npm start"
   },
   "dependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
+    "lucide-react": "^1.28.0",
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.3.3",
     "ws": "^8.18.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.1",
     "@types/node": "^22.15.2",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
     "@types/ws": "^8.5.14",
     "@vitejs/plugin-react": "^4.4.1",
     "concurrently": "^9.1.2",
-    "tsx": "^4.19.3",
-    "typescript": "^5.8.3",
-    "vite": "^6.3.3",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "@types/react": "^19.1.2",
-    "@types/react-dom": "^19.1.2"
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.3"
   }
 }

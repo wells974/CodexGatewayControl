@@ -8,6 +8,8 @@
     "skipLibCheck": true,
     "outDir": "dist-controller",
     "rootDir": "src",
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"] },
     "types": ["node"]
   },
   "include": ["src/controller/**/*.ts", "src/injector/**/*.ts"]
