@@ -1,0 +1,38 @@
+{
+  "name": "codex-gateway-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:controller\" \"npm:dev:web\"",
+    "dev:controller": "tsx watch src/controller/index.ts",
+    "dev:web": "vite --host 127.0.0.1",
+    "build": "tsc -p tsconfig.json && vite build",
+    "start": "node dist-controller/controller/index.js",
+    "inject": "npm run codex:attach",
+    "codex": "npm run build && node scripts/codex-gateway.mjs --launch --watch --open",
+    "gateway:codex": "npm run codex",
+    "codex:attach": "npm run build && node scripts/codex-gateway.mjs --attach-existing --watch --open",
+    "gateway": "npm start"
+  },
+  "dependencies": {
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.15.2",
+    "@types/ws": "^8.5.14",
+    "@vitejs/plugin-react": "^4.4.1",
+    "concurrently": "^9.1.2",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.3",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2"
+  }
+}
