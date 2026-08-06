@@ -9,12 +9,16 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import WebSocket from "ws";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
+const root = path.resolve(process.env.GATEWAY_RUNTIME_ROOT ?? path.join(scriptDirectory, ".."));
 const defaultPort = Number(process.env.CODEX_CDP_PORT ?? 9237);
-let controllerUrl = process.env.GATEWAY_ORIGIN ?? "http://127.0.0.1:4000";
-let gatewayUiOrigin = process.env.GATEWAY_UI_ORIGIN ?? `https://127.0.0.1:${Number(process.env.GATEWAY_UI_TLS_PORT ?? 4401)}`;
+const defaultControllerPort = Number(process.env.GATEWAY_PORT ?? process.env.CONTROLLER_PORT ?? 4000);
+const defaultUiTlsPort = Number(process.env.GATEWAY_UI_TLS_PORT ?? 4401);
+let controllerUrl = process.env.GATEWAY_ORIGIN ?? `http://127.0.0.1:${defaultControllerPort}`;
+let gatewayUiOrigin = process.env.GATEWAY_UI_ORIGIN ?? `https://127.0.0.1:${defaultUiTlsPort}`;
 const gatewayTlsCertificatePath = path.join(path.resolve(process.env.GATEWAY_DATA_DIR ?? ".data"), "gateway-ui-cert.pem");
-const injectionPath = path.join(root, "inject", "codex-gateway.user.js");
+const injectionPath = path.resolve(process.env.CODEX_INJECTION_PATH ?? path.join(root, "inject", "codex-gateway.user.js"));
+const controllerEntryPath = path.resolve(process.env.GATEWAY_CONTROLLER_ENTRY ?? path.join(root, "dist-controller", "controller", "index.js"));
 
 function parseArgs(argv) {
   const options = {
@@ -177,8 +181,7 @@ function run(command, args, options = {}) {
 }
 
 function startController(ports) {
-  const entry = path.join(root, "dist-controller", "controller", "index.js");
-  const child = spawn(process.execPath, [entry], {
+  const child = spawn(process.execPath, [controllerEntryPath], {
     cwd: root,
     stdio: "inherit",
     env: {
@@ -197,7 +200,7 @@ function startController(ports) {
  * 结束 launcher 自己启动的 Controller 进程。
  * @param {import("node:child_process").ChildProcess} child Controller 子进程。
  * @returns 无返回值。
- * @remarks Windows 使用 `taskkill /T` 清理进程树；不会触碰 Docker、LiteLLM 或用户原有 Desktop 进程。
+ * @remarks Windows 使用 `taskkill /T` 清理进程树；不会触碰用户原有 Desktop 进程。
  */
 function stopController(child) {
   if (!child?.pid) return;

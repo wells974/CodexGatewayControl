@@ -1,6 +1,10 @@
 node_modules/
 dist-web/
 dist-controller/
+dist-runtime/
+packaging/node-runtime/
+release/
+.cache/
 .env
 .data/
 *.log

@@ -465,7 +465,7 @@ app.post("/api/upstreams/:id/test-request", requireLocalToken, async (request, r
 
 app.all("/v1/{*path}", proxyRequest);
 
-const webRoot = path.join(root, "dist-web");
+const webRoot = path.resolve(process.env.GATEWAY_WEB_DIR ?? path.join(root, "dist-web"));
 app.use((request, response, next) => {
   if (request.method === "GET" && !request.path.startsWith("/api") && request.path !== "/health" && !request.path.startsWith("/v1/")) {
     issueSessionCookie(request, response);

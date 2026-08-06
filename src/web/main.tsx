@@ -445,7 +445,7 @@ function App() {
                   <div className="flex min-w-0 items-center gap-2 text-xs text-indigo-100/70"><Activity className="size-3.5 shrink-0" />Codex 请求入口</div>
                   <Tooltip><TooltipTrigger asChild><Button aria-label="一键配置当前机器的 Codex" className="shrink-0" disabled={!status?.codexConfiguration.available || Boolean(busy)} onClick={() => setCodexConfigurationDialogOpen(true)} size="sm" type="button" variant="secondary"><Settings2 />一键配置</Button></TooltipTrigger><TooltipContent>{status?.codexConfiguration.available ? "配置当前机器的 Codex" : "请先设置 GATEWAY_ACCESS_TOKEN"}</TooltipContent></Tooltip>
                 </div>
-                <p className="mt-2 truncate font-mono text-sm font-medium">{status?.gateway.baseUrl ?? "http://127.0.0.1:4000"}/v1</p>
+                <p className="mt-2 truncate font-mono text-sm font-medium">{status?.gateway.baseUrl ? `${status.gateway.baseUrl}/v1` : "等待 Gateway 连接"}</p>
                 <p className="mt-2 text-xs leading-5 text-indigo-100/70">模型名、请求体与 SSE 响应均原样透传。</p>
               </div>
             </div>

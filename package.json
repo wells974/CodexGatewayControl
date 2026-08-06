@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "desktop/main.cjs",
+  "description": "Codex 本地 Gateway 管理工具",
+  "author": "Codex Gateway Control",
   "engines": {
     "node": ">=22"
   },
@@ -11,7 +14,13 @@
     "dev:controller": "tsx watch src/controller/index.ts",
     "dev:web": "vite --host 127.0.0.1",
     "build": "tsc -p tsconfig.json && vite build",
+    "build:runtime": "npm run build && node scripts/build-runtime.mjs",
     "start": "node dist-controller/controller/index.js",
+    "desktop:dev": "npm run build:runtime && electron .",
+    "package:win": "npm run build:runtime && node scripts/fetch-node-runtime.mjs --target win-x64 && electron-builder --win nsis --x64",
+    "package:mac:intel": "npm run build:runtime && node scripts/fetch-node-runtime.mjs --target mac-x64 && electron-builder --mac dmg --x64",
+    "package:mac:arm64": "npm run build:runtime && node scripts/fetch-node-runtime.mjs --target mac-arm64 && electron-builder --mac dmg --arm64",
+    "package:all": "npm run package:win && npm run package:mac:intel && npm run package:mac:arm64",
     "inject": "npm run codex",
     "codex": "npm run build && node scripts/codex-gateway.mjs --launch --watch --open",
     "gateway:codex": "npm run codex",
@@ -34,6 +43,31 @@
     "tailwindcss": "^4.3.3",
     "ws": "^8.18.1"
   },
+  "build": {
+    "appId": "com.codex.gatewaycontrol",
+    "productName": "Codex Gateway Control",
+    "asar": true,
+    "directories": { "output": "release" },
+    "files": ["desktop/**", "!node_modules/**"],
+    "extraResources": [
+      { "from": "dist-runtime", "to": "gateway-runtime" },
+      { "from": "packaging/node-runtime", "to": "node-runtime" }
+    ],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "artifactName": "CodexGatewayControl-${version}-win-${arch}.${ext}"
+    },
+    "mac": {
+      "target": [{ "target": "dmg", "arch": ["x64", "arm64"] }],
+      "artifactName": "CodexGatewayControl-${version}-mac-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
   "devDependencies": {
     "@types/express": "^5.0.1",
     "@types/node": "^22.15.2",
@@ -42,6 +76,9 @@
     "@types/ws": "^8.5.14",
     "@vitejs/plugin-react": "^4.4.1",
     "concurrently": "^9.1.2",
+    "electron": "^43.3.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "tsx": "^4.19.3",
