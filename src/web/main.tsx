@@ -1,15 +1,92 @@
-import { FormEvent, StrictMode, useCallback, useEffect, useState } from "react";
+import { type FormEvent, StrictMode, useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
+import {
+  Activity,
+  ArrowRight,
+  Check,
+  ChevronsUpDown,
+  CircleAlert,
+  CircleCheck,
+  CircleX,
+  CircleHelp,
+  FlaskConical,
+  Gauge,
+  KeyRound,
+  LoaderCircle,
+  Network,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Route,
+  Server,
+  Trash2
+} from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle
+} from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList
+} from "@/components/ui/command";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Textarea } from "@/components/ui/textarea";
+import { Toast, ToastClose, ToastDescription, ToastProvider, ToastTitle, ToastViewport } from "@/components/ui/toast";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 import "./styles.css";
 
-type Upstream = { id: string; name: string; apiBase: string; apiKeyConfigured: boolean; healthy?: boolean; latencyMs?: number; error?: string };
-type Status = { gateway: { healthy: boolean; baseUrl: string }; activeUpstream: Pick<Upstream, "id" | "name" | "apiBase"> | null; upstreams: Upstream[]; notice: string };
+type Upstream = {
+  id: string;
+  name: string;
+  apiBase: string;
+  apiKeyConfigured: boolean;
+  healthy?: boolean;
+  latencyMs?: number;
+  error?: string;
+};
+type Status = {
+  gateway: { healthy: boolean; baseUrl: string };
+  activeUpstream: Pick<Upstream, "id" | "name" | "apiBase"> | null;
+  upstreams: Upstream[];
+  notice: string;
+};
 type Draft = { id: string; name: string; apiBase: string; apiKey: string };
 type TestTarget = Pick<Upstream, "id" | "name" | "apiBase">;
 type TestResult = { endpoint: "/v1/responses"; stream: boolean; status: number; outputText: string | null; truncated: boolean };
 type ModelList = { models: string[] };
+type ToastMessage = { id: number; title: string; description: string; variant: "default" | "destructive" };
+
 const emptyDraft: Draft = { id: "", name: "", apiBase: "", apiKey: "" };
 
+/**
+ * 调用本地 Controller 管理接口，并将服务端错误转换为可展示的异常。
+ * @param url Controller 相对路径。
+ * @param init 请求配置。
+ * @returns 已解析的响应数据。
+ * @throws 当 Controller 返回非成功状态时抛出中文错误。
+ */
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, { ...init, headers: { "content-type": "application/json", ...init?.headers } });
   const data = await response.json().catch(() => ({})) as T & { error?: string };
@@ -17,6 +94,12 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   return data;
 }
 
+/**
+ * 从不完整的 SSE 文本中切出已接收完整帧，并保留待下一批数据拼接的尾部。
+ * @param chunk 追加到当前缓冲区后的 SSE 文本。
+ * @returns 已完成帧与尚未完成的尾部。
+ * @remarks SSE 帧可能被网络分割，不能假设单次读取就是完整事件。
+ */
 function sseFrames(chunk: string): { frames: string[]; pending: string } {
   const frames: string[] = [];
   let pending = chunk;
@@ -29,12 +112,78 @@ function sseFrames(chunk: string): { frames: string[]; pending: string } {
   return { frames, pending };
 }
 
+/**
+ * 为模型选择提供可搜索且限高滚动的 shadcn 组合控件。
+ * @param props 当前模型、可用模型和选择回调。
+ * @returns 模型选择弹出层。
+ * @remarks 模型列表来自目标中转，最多由 Controller 返回 500 项。
+ */
+function ModelPicker({
+  value,
+  models,
+  disabled,
+  onValueChange,
+  portalContainer
+}: {
+  value: string;
+  models: string[];
+  disabled: boolean;
+  onValueChange: (model: string) => void;
+  portalContainer: HTMLElement | null;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return <Popover open={open} onOpenChange={setOpen}>
+    <PopoverTrigger asChild>
+      <Button
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        className="h-10 w-full justify-between border-border bg-background font-mono text-xs font-normal hover:bg-accent"
+        disabled={disabled}
+        role="combobox"
+        type="button"
+        variant="outline"
+      >
+        <span className="truncate">{value || "请选择模型"}</span>
+        <ChevronsUpDown className="ml-2 shrink-0 text-muted-foreground" />
+      </Button>
+    </PopoverTrigger>
+    <PopoverContent align="start" className="w-[var(--radix-popover-trigger-width)] p-0" container={portalContainer}>
+      <Command>
+        <CommandInput placeholder="搜索模型" />
+        <CommandList className="max-h-60 overscroll-contain">
+          <CommandEmpty>没有匹配的模型</CommandEmpty>
+          <CommandGroup heading="可测试模型">
+            {models.map((model) => <CommandItem
+              key={model}
+              onSelect={() => { onValueChange(model); setOpen(false); }}
+              value={model}
+            >
+              <Check className={cn("text-primary", value === model ? "opacity-100" : "opacity-0")} />
+              <span className="truncate font-mono text-xs">{model}</span>
+            </CommandItem>)}
+          </CommandGroup>
+        </CommandList>
+      </Command>
+    </PopoverContent>
+  </Popover>;
+}
+
+/**
+ * 渲染网关管理工作台并协调中转管理、健康检查和流式测试状态。
+ * @returns 完整的本地管理页。
+ * @remarks 所有敏感操作都通过同源 Controller 会话执行，浏览器不持有上游密钥。
+ */
 function App() {
   const [status, setStatus] = useState<Status>();
   const [draft, setDraft] = useState<Draft>(emptyDraft);
   const [editing, setEditing] = useState<string | null>(null);
+  const [upstreamDialogOpen, setUpstreamDialogOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<Upstream>();
+  const [activateTarget, setActivateTarget] = useState<Upstream>();
+  const [routeGuideOpen, setRouteGuideOpen] = useState(false);
   const [busy, setBusy] = useState<string>();
-  const [message, setMessage] = useState<string>();
+  const [toastMessage, setToastMessage] = useState<ToastMessage>();
   const [testModel, setTestModel] = useState("");
   const [testModels, setTestModels] = useState<string[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
@@ -44,45 +193,124 @@ function App() {
   const [streamingText, setStreamingText] = useState("");
   const [testOpen, setTestOpen] = useState(false);
   const [testTarget, setTestTarget] = useState<TestTarget>();
-  const refresh = useCallback(async () => { try { setStatus(await api<Status>("/api/status")); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } }, []);
+  const [testDialogElement, setTestDialogElement] = useState<HTMLDivElement | null>(null);
 
-  useEffect(() => { void refresh(); const timer = window.setInterval(() => void refresh(), 5_000); return () => window.clearInterval(timer); }, [refresh]);
+  /**
+   * 显示统一的短暂操作反馈。
+   * @param variant 反馈的成功或错误状态。
+   * @param description 显示给用户的具体内容。
+   * @returns 无返回值。
+   */
+  function notify(variant: ToastMessage["variant"], description: string): void {
+    setToastMessage({ id: Date.now(), title: variant === "destructive" ? "操作失败" : "操作完成", description, variant });
+  }
+
+  /** 读取公开状态并同步页面中的中转和当前路由信息。 */
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await api<Status>("/api/status"));
+    } catch (error) {
+      notify("destructive", error instanceof Error ? error.message : String(error));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  /** 更新弹窗表单中的单个中转字段。 */
   const set = (key: keyof Draft, value: string) => setDraft((current) => ({ ...current, [key]: value }));
 
-  async function run(key: string, action: () => Promise<unknown>) {
-    setBusy(key); setMessage(undefined);
-    try { const result = await action() as { message?: string }; setMessage(result.message ?? "已保存。"); await refresh(); }
-    catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(undefined); }
+  /**
+   * 在执行写操作时统一维护忙碌状态、反馈信息和后续状态刷新。
+   * @param key 本次操作的唯一忙碌标识。
+   * @param action 实际请求。
+   * @param successMessage 没有服务端消息时显示的成功提示。
+   * @returns 请求结束后的 Promise。
+   */
+  async function run(key: string, action: () => Promise<unknown>, successMessage: string): Promise<void> {
+    setBusy(key);
+    try {
+      const result = await action() as { message?: string };
+      notify("default", result.message ?? successMessage);
+      await refresh();
+    } catch (error) {
+      notify("destructive", error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(undefined);
+    }
   }
 
-  function submit(event: FormEvent) {
+  /**
+   * 提交新增或编辑中转的表单。
+   * @param event 原生表单提交事件。
+   * @returns 无返回值。
+   * @remarks 编辑时空 API Key 表示保留本地已有凭据。
+   */
+  function submit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
-    const payload = editing ? { name: draft.name, apiBase: draft.apiBase, ...(draft.apiKey ? { apiKey: draft.apiKey } : {}) } : draft;
+    const payload = editing
+      ? { name: draft.name, apiBase: draft.apiBase, ...(draft.apiKey ? { apiKey: draft.apiKey } : {}) }
+      : draft;
     void run(editing ? `edit-${editing}` : "create", async () => {
-      const result = await api(`/api/upstreams${editing ? `/${editing}` : ""}`, { method: editing ? "PATCH" : "POST", body: JSON.stringify(payload) });
-      setDraft(emptyDraft); setEditing(null); return result;
-    });
+      const result = await api(`/api/upstreams${editing ? `/${editing}` : ""}`, {
+        method: editing ? "PATCH" : "POST",
+        body: JSON.stringify(payload)
+      });
+      setDraft(emptyDraft);
+      setEditing(null);
+      setUpstreamDialogOpen(false);
+      return result;
+    }, editing ? "中转已更新。" : "中转已添加。");
   }
 
-  function edit(upstream: Upstream) {
-    setEditing(upstream.id); setDraft({ id: upstream.id, name: upstream.name, apiBase: upstream.apiBase, apiKey: "" });
+  /** 打开空白表单以新增中转。 */
+  function openCreate(): void {
+    setEditing(null);
+    setDraft(emptyDraft);
+    setUpstreamDialogOpen(true);
   }
 
-  function runCodexTest(event: FormEvent) {
+  /**
+   * 以现有中转信息打开编辑表单。
+   * @param upstream 要编辑的中转。
+   * @returns 无返回值。
+   */
+  function openEdit(upstream: Upstream): void {
+    setEditing(upstream.id);
+    setDraft({ id: upstream.id, name: upstream.name, apiBase: upstream.apiBase, apiKey: "" });
+    setUpstreamDialogOpen(true);
+  }
+
+  /**
+   * 提交测试表单并启动真实的 Responses SSE 请求。
+   * @param event 原生表单提交事件。
+   * @returns 无返回值。
+   */
+  function runCodexTest(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
     void runStreamingTest();
   }
 
-  async function runStreamingTest() {
+  /**
+   * 发起流式测试并逐帧追加 Controller 提取后的模型文本。
+   * @returns 流完成后的 Promise。
+   * @remarks 当前中转通过 Gateway 回环测试，其他中转只直连测试，不会改变实际路由。
+   */
+  async function runStreamingTest(): Promise<void> {
     if (!testTarget) return;
     setBusy("codex-test");
-    setMessage(undefined);
     setTestResult(undefined);
     setStreamingText("");
     try {
-      const endpoint = status?.activeUpstream?.id === testTarget.id ? "/api/test-request" : `/api/upstreams/${testTarget.id}/test-request`;
-      const response = await fetch(endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: testModel, prompt: testPrompt, stream: true }) });
+      const endpoint = status?.activeUpstream?.id === testTarget.id
+        ? "/api/test-request"
+        : `/api/upstreams/${testTarget.id}/test-request`;
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: testModel, prompt: testPrompt, stream: true })
+      });
       if (!response.ok) {
         const data = await response.json().catch(() => ({})) as { error?: string };
         throw new Error(data.error ?? `请求失败（${response.status}）`);
@@ -99,28 +327,48 @@ function App() {
         pending = parsed.pending;
         for (const frame of parsed.frames) {
           const event = frame.match(/^event:\s*(.+)$/m)?.[1]?.trim();
-          const data = frame.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+          const data = frame.split(/\r?\n/)
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trim())
+            .join("\n");
           if (!data) continue;
-          const payload = JSON.parse(data) as { text?: string; error?: string; endpoint?: "/v1/responses"; stream?: boolean; status?: number; truncated?: boolean };
+          const payload = JSON.parse(data) as {
+            text?: string;
+            error?: string;
+            endpoint?: "/v1/responses";
+            status?: number;
+            truncated?: boolean;
+          };
           if (event === "delta" && typeof payload.text === "string") setStreamingText((current) => current + payload.text);
           if (event === "error") throw new Error(payload.error ?? "接收流式响应失败。");
           if (event === "complete") {
-            setTestResult({ endpoint: payload.endpoint ?? "/v1/responses", stream: true, status: payload.status ?? 200, outputText: null, truncated: payload.truncated === true });
+            setTestResult({
+              endpoint: payload.endpoint ?? "/v1/responses",
+              stream: true,
+              status: payload.status ?? 200,
+              outputText: null,
+              truncated: payload.truncated === true
+            });
             completed = true;
           }
         }
       }
       if (!completed) throw new Error("中转在完成前关闭了流式响应。");
-      setMessage("流式响应已完成。");
+      notify("default", "流式响应已完成。");
       await refresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
+      notify("destructive", error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(undefined);
     }
   }
 
-  async function openTest(upstream: TestTarget) {
+  /**
+   * 打开指定中转的测试窗口并读取其可用模型列表。
+   * @param upstream 将要测试的中转。
+   * @returns 模型列表读取结束后的 Promise。
+   */
+  async function openTest(upstream: TestTarget): Promise<void> {
     setTestResult(undefined);
     setStreamingText("");
     setTestOpen(true);
@@ -142,43 +390,270 @@ function App() {
     }
   }
 
-  return <main>
-    <header><div><p className="eyebrow">本地 OPENAI 兼容网关</p><h1>Codex Gateway Control</h1></div><div className="header-actions"><div className="proxy ok"><i /> 网关在线</div><button className="switch" disabled={!status?.activeUpstream} onClick={() => { if (status?.activeUpstream) void openTest(status.activeUpstream); }}>测试当前中转</button></div></header>
-    <section className="route"><div><span>当前中转</span><strong>{status?.activeUpstream?.name ?? "尚未选择"}</strong></div><div className="route-arrow">透明转发</div><div><span>Codex 模型</span><strong>原样透传</strong></div><div className="route-meta">{status?.gateway.baseUrl ?? "http://127.0.0.1:4000"}/v1</div></section>
-    <section className="notice"><b>路由规则</b><span>{status?.notice ?? "正在读取网关状态..."}</span></section>
-    {message && <p className="message" role="status">{message}</p>}
-    <section className="management">
-      <form onSubmit={submit}><div className="form-title"><h2>{editing ? `编辑 ${editing}` : "新增中转"}</h2>{editing && <button type="button" onClick={() => { setEditing(null); setDraft(emptyDraft); }}>取消</button>}</div>
-        <label>标识符<input required disabled={Boolean(editing)} value={draft.id} onChange={(event) => set("id", event.target.value)} placeholder="provider-a" pattern="[A-Za-z0-9_-]+" /></label>
-        <label>名称<input required value={draft.name} onChange={(event) => set("name", event.target.value)} placeholder="中转 A" /></label>
-        <label>OpenAI 兼容基础 URL<input required type="url" value={draft.apiBase} onChange={(event) => set("apiBase", event.target.value)} placeholder="https://gateway.example.com/v1" /></label>
-        <label>API Key<input required={!editing} type="password" value={draft.apiKey} onChange={(event) => set("apiKey", event.target.value)} placeholder={editing ? "留空则保留现有 API Key" : "仅保存在本地 SQLite"} /></label>
-        <button className="switch" disabled={Boolean(busy)} type="submit">{editing ? "保存中转" : "添加中转"}</button>
-      </form>
-      <section className="upstreams" aria-label="中转列表">
-        {status?.upstreams.map((upstream) => <article className={status.activeUpstream?.id === upstream.id ? "active" : ""} key={upstream.id}>
-          <div className="card-head"><h2>{upstream.name}</h2><span className={`health ${upstream.healthy === undefined ? "unknown" : upstream.healthy ? "ok" : "bad"}`}>{upstream.healthy === undefined ? "未检查" : upstream.healthy ? "可用" : "不可用"}</span></div>
-          <dl><div><dt>标识符</dt><dd>{upstream.id}</dd></div><div><dt>地址</dt><dd title={upstream.apiBase}>{upstream.apiBase}</dd></div><div><dt>凭据</dt><dd>{upstream.apiKeyConfigured ? "已保存在本地" : "缺失"}</dd></div><div><dt>延迟</dt><dd>{upstream.latencyMs ? `${upstream.latencyMs} ms` : "-"}</dd></div></dl>
-          {upstream.error && <p className="error">最近错误：{upstream.error}</p>}
-          <div className="actions"><button disabled={Boolean(busy)} onClick={() => void openTest(upstream)}>测试</button><button disabled={Boolean(busy)} onClick={() => edit(upstream)}>编辑</button><button className="switch" disabled={Boolean(busy) || status.activeUpstream?.id === upstream.id} onClick={() => run(`activate-${upstream.id}`, () => api(`/api/upstreams/${upstream.id}/activate`, { method: "POST" }))}>{status.activeUpstream?.id === upstream.id ? "当前使用中" : "使用此中转"}</button><button className="danger" disabled={Boolean(busy)} onClick={() => { if (window.confirm(`确定删除 ${upstream.name}？`)) void run(`delete-${upstream.id}`, () => api(`/api/upstreams/${upstream.id}`, { method: "DELETE" })); }}>删除</button></div>
-        </article>)}
-      </section>
-    </section>
-    {testOpen && testTarget && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setTestOpen(false); }}>
-      <section className="test-modal" role="dialog" aria-modal="true" aria-labelledby="test-title">
-        <header className="modal-header"><h2 id="test-title">测试当前中转</h2><button className="icon-button" type="button" aria-label="关闭测试窗口" disabled={Boolean(busy)} onClick={() => setTestOpen(false)}>×</button></header>
-        <div className="modal-body">
-          <div className="test-target"><div className="target-mark">↗</div><div><strong>{testTarget.name}</strong><p><code>{testTarget.id}</code><span>{status?.activeUpstream?.id === testTarget.id ? "当前使用中转" : "不会切换当前路由"}</span></p></div><b>{status?.activeUpstream?.id === testTarget.id ? "使用中" : "测试目标"}</b></div>
-          <form className="test-form" id="test-request-form" onSubmit={runCodexTest}>
-            <label>选择测试模型<select required autoFocus disabled={loadingModels || Boolean(modelsError)} value={testModel} onChange={(event) => setTestModel(event.target.value)}><option value="">{loadingModels ? "正在读取中转模型..." : "请选择模型"}</option>{testModels.map((model) => <option key={model} value={model}>{model}</option>)}</select>{modelsError && <small className="model-error">{modelsError}</small>}</label>
-            <label>测试消息<textarea required value={testPrompt} onChange={(event) => setTestPrompt(event.target.value)} rows={3} /></label>
-            <p className="request-hint">会通过 <code>POST /v1/responses</code> 发起一次真实流式请求，模型名与请求路径原样透传。</p>
-          </form>
-          <section className="test-console" aria-live="polite"><div className="console-status"><span>请求路径：<b>/v1/responses</b></span><span>目标：<b>{testTarget.name}</b></span></div><p>使用模型：<em>{testModel || "等待选择模型"}</em></p><p>测试消息：<em>{testPrompt || "等待填写测试消息"}</em></p>{busy === "codex-test" ? <><p>模型回复：</p><div className="model-output streaming-output">{streamingText || "正在等待第一个文本增量..."}</div><div className="console-streaming">正在实时接收...</div></> : testResult ? <><p>HTTP 状态：<em className={testResult.status >= 200 && testResult.status < 300 ? "success" : "failure"}>{testResult.status}</em></p><p>模型回复：</p><div className="model-output">{streamingText || "模型未返回可显示的文本内容。"}</div><div className="console-finish">{testResult.status >= 200 && testResult.status < 300 ? "测试完成" : "请求已返回错误"}{testResult.truncated ? "，响应内容已截断" : ""}</div></> : <p className="console-idle">尚未发送请求。请求结果会显示在这里。</p>}</section>
+  const activeUpstream = status?.activeUpstream;
+  const gatewayOnline = status?.gateway.healthy === true;
+  const upstreams = status?.upstreams ?? [];
+
+  return <ToastProvider label="通知">
+    <TooltipProvider>
+      <main className="min-h-screen bg-background px-4 py-5 text-foreground sm:px-7 sm:py-7">
+        <div className="mx-auto max-w-7xl">
+          <header className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-muted-foreground">Codex</span>
+              <span aria-hidden="true" className="h-4 w-px bg-border" />
+              <h1 className="text-base font-semibold tracking-normal">Gateway</h1>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge className={cn("gap-1.5 border-0 px-2.5 py-1", gatewayOnline ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700")} variant="secondary">
+                <span className={cn("size-1.5 rounded-full", gatewayOnline ? "bg-emerald-500" : "bg-destructive")} />
+                {gatewayOnline ? "网关运行中" : "网关状态未知"}
+              </Badge>
+              <Button onClick={() => setRouteGuideOpen(true)} size="sm" variant="ghost">
+                <CircleHelp className="size-3.5" aria-hidden="true" />
+                路由说明
+              </Button>
+              <Button onClick={() => void refresh()} size="sm" variant="outline">
+                <RefreshCw className="size-3.5" aria-hidden="true" />
+                刷新状态
+              </Button>
+              <Button onClick={openCreate} size="sm">
+                <Plus className="size-4" aria-hidden="true" />
+                添加中转
+              </Button>
+            </div>
+          </header>
+
+          <section aria-labelledby="route-title" className="relative mt-7 overflow-hidden rounded-[20px] bg-[#292d58] px-5 py-6 text-white shadow-[0_16px_32px_rgb(40_44_84/16%)] sm:px-7 sm:py-7">
+            <div aria-hidden="true" className="absolute -top-14 right-[22%] size-40 rounded-full border border-white/10 bg-white/5" />
+            <div aria-hidden="true" className="absolute -right-10 -bottom-16 size-52 rounded-full bg-[#7d7cf6]/25 blur-2xl" />
+            <div className="relative grid gap-6 lg:grid-cols-[minmax(0,1fr)_auto_minmax(280px,0.9fr)] lg:items-center">
+              <div>
+                <div className="mb-3 flex items-center gap-2 text-xs font-medium text-indigo-200"><Route className="size-3.5" />当前转发路由</div>
+                {activeUpstream ? <>
+                  <h2 id="route-title" className="text-2xl font-semibold sm:text-3xl">{activeUpstream.name}</h2>
+                  <p className="mt-2 max-w-xl truncate font-mono text-sm text-indigo-100/80" title={activeUpstream.apiBase}>{activeUpstream.apiBase}</p>
+                </> : <>
+                  <h2 id="route-title" className="text-2xl font-semibold sm:text-3xl">尚未选择中转</h2>
+                  <p className="mt-2 text-sm text-indigo-100/80">添加中转后，即可将 Codex 请求转发到指定服务。</p>
+                </>}
+              </div>
+              <div className="hidden items-center gap-2 text-indigo-200 lg:flex"><span className="grid size-9 place-items-center rounded-full border border-white/15 bg-white/8"><Server className="size-4" /></span><ArrowRight className="size-4" /><span className="grid size-9 place-items-center rounded-full border border-white/15 bg-white/8"><Network className="size-4" /></span></div>
+              <div className="rounded-xl border border-white/12 bg-white/8 p-4 backdrop-blur-sm">
+                <div className="flex items-center gap-2 text-xs text-indigo-100/70"><Activity className="size-3.5" />Codex 请求入口</div>
+                <p className="mt-2 truncate font-mono text-sm font-medium">{status?.gateway.baseUrl ?? "http://127.0.0.1:4000"}/v1</p>
+                <p className="mt-2 text-xs leading-5 text-indigo-100/70">模型名、请求体与 SSE 响应均原样透传。</p>
+              </div>
+            </div>
+          </section>
+
+          <section aria-label="网关概览" className="mt-5 grid gap-3 sm:grid-cols-3">
+            <article className="rounded-2xl border border-border bg-card p-4 shadow-[0_4px_14px_rgb(25_34_68/4%)]">
+              <div className="flex items-center justify-between"><span className="grid size-9 place-items-center rounded-lg bg-[#eeeefe] text-primary"><Network className="size-4" /></span><Badge variant="outline">本机</Badge></div>
+              <p className="mt-4 text-sm text-muted-foreground">网关状态</p>
+              <p className="mt-1 text-lg font-semibold">{gatewayOnline ? "运行正常" : "等待连接"}</p>
+            </article>
+            <article className="rounded-2xl border border-border bg-card p-4 shadow-[0_4px_14px_rgb(25_34_68/4%)]">
+              <div className="flex items-center justify-between"><span className="grid size-9 place-items-center rounded-lg bg-[#e8f5ff] text-[#3d80c4]"><Server className="size-4" /></span><span className="text-xs font-medium text-muted-foreground">可管理节点</span></div>
+              <p className="mt-4 text-sm text-muted-foreground">中转数量</p>
+              <p className="mt-1 text-lg font-semibold">{upstreams.length} <span className="text-sm font-medium text-muted-foreground">个节点</span></p>
+            </article>
+            <article className="rounded-2xl border border-border bg-card p-4 shadow-[0_4px_14px_rgb(25_34_68/4%)]">
+              <div className="flex items-center justify-between"><span className="grid size-9 place-items-center rounded-lg bg-[#eaf8f1] text-[#24946b]"><Gauge className="size-4" /></span><span className="text-xs font-medium text-muted-foreground">当前延迟</span></div>
+              <p className="mt-4 text-sm text-muted-foreground">当前中转</p>
+              <p className="mt-1 truncate text-lg font-semibold">{activeUpstream?.name ?? "未选择"}</p>
+            </article>
+          </section>
+
+          <section className="mt-8">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <p className="text-xs font-medium text-primary">上游管理</p>
+                <h2 className="mt-1 text-xl font-semibold">中转节点</h2>
+                <p className="mt-1 text-sm text-muted-foreground">选择一个节点作为当前路由，其他节点仍可独立检查和测试。</p>
+              </div>
+              {activeUpstream && <Button onClick={() => void openTest(activeUpstream)} size="sm" variant="secondary"><FlaskConical className="size-3.5" />测试当前中转</Button>}
+            </div>
+            <section aria-label="中转列表" className="mt-4 grid gap-3">
+              {upstreams.length === 0 && <div className="rounded-2xl border border-dashed border-border bg-card py-16 text-center shadow-[0_4px_14px_rgb(25_34_68/4%)]">
+                <Network className="mx-auto size-8 text-primary" aria-hidden="true" />
+                <p className="mt-4 text-sm font-semibold">尚无中转节点</p>
+                <p className="mt-1 text-sm text-muted-foreground">添加后即可让 Codex 经本机网关转发。</p>
+                <Button className="mt-5" onClick={openCreate} size="sm"><Plus />添加第一个中转</Button>
+              </div>}
+              {upstreams.map((upstream) => {
+                const isActive = activeUpstream?.id === upstream.id;
+                const health = upstream.healthy === undefined ? "未检查" : upstream.healthy ? "连接正常" : "连接异常";
+                const healthVariant = upstream.healthy === false ? "destructive" : upstream.healthy === true ? "secondary" : "outline";
+                return <article className={cn("rounded-2xl border border-border bg-card p-4 shadow-[0_4px_14px_rgb(25_34_68/4%)] transition-colors sm:p-5", isActive && "border-primary/25 bg-[#fbfbff] shadow-[0_10px_24px_rgb(91_92_240/10%)]")} key={upstream.id}>
+                  <div className="grid gap-5 lg:grid-cols-[auto_minmax(0,1fr)_auto] lg:items-center">
+                    <div className={cn("grid size-11 place-items-center rounded-xl bg-muted text-muted-foreground", isActive && "bg-primary text-primary-foreground")}><Server className="size-5" /></div>
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2"><h3 className="font-semibold">{upstream.name}</h3>{isActive && <Badge className="gap-1" variant="default"><Check className="size-3" />当前路由</Badge>}<Badge className="gap-1" variant={healthVariant}>{upstream.healthy === false ? <CircleX /> : upstream.healthy === true ? <CircleCheck /> : <Gauge />}{health}</Badge></div>
+                      <p className="mt-2 truncate font-mono text-xs text-muted-foreground" title={upstream.apiBase}>{upstream.apiBase}</p>
+                      <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground"><span>标识符 <b className="ml-1 font-mono font-medium text-foreground">{upstream.id}</b></span><span>延迟 <b className="ml-1 font-medium text-foreground">{upstream.latencyMs === undefined ? "待测" : `${upstream.latencyMs} ms`}</b></span><span>凭据 <b className="ml-1 font-medium text-foreground">{upstream.apiKeyConfigured ? "已配置" : "缺失"}</b></span></div>
+                      {upstream.error && <p className="mt-3 flex items-start gap-1.5 text-xs leading-5 text-destructive"><CircleAlert className="mt-0.5 size-3.5 shrink-0" />最近错误：{upstream.error}</p>}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5 lg:justify-end">
+                      <Tooltip><TooltipTrigger asChild><Button aria-label={`检查 ${upstream.name} 的连通性`} disabled={Boolean(busy)} onClick={() => void run(`probe-${upstream.id}`, () => api(`/api/upstreams/${upstream.id}/test`, { method: "POST" }), "连通性检查已完成。")} size="icon-sm" type="button" variant="ghost"><Activity /></Button></TooltipTrigger><TooltipContent>检查连通性</TooltipContent></Tooltip>
+                      <Tooltip><TooltipTrigger asChild><Button aria-label={`测试 ${upstream.name}`} disabled={Boolean(busy)} onClick={() => void openTest(upstream)} size="icon-sm" type="button" variant="ghost"><FlaskConical /></Button></TooltipTrigger><TooltipContent>发送真实测试请求</TooltipContent></Tooltip>
+                      <Tooltip><TooltipTrigger asChild><Button aria-label={`编辑 ${upstream.name}`} disabled={Boolean(busy)} onClick={() => openEdit(upstream)} size="icon-sm" type="button" variant="ghost"><Pencil /></Button></TooltipTrigger><TooltipContent>编辑中转</TooltipContent></Tooltip>
+                      <Tooltip><TooltipTrigger asChild><Button aria-label={`删除 ${upstream.name}`} disabled={Boolean(busy)} onClick={() => setDeleteTarget(upstream)} size="icon-sm" type="button" variant="ghost"><Trash2 className="text-destructive" /></Button></TooltipTrigger><TooltipContent>删除中转</TooltipContent></Tooltip>
+                      <Button disabled={Boolean(busy) || isActive} onClick={() => setActivateTarget(upstream)} size="sm" type="button" variant={isActive ? "secondary" : "default"}>{isActive ? <><Check />正在使用</> : "设为当前"}</Button>
+                    </div>
+                  </div>
+                </article>;
+              })}
+            </section>
+          </section>
         </div>
-        <footer className="modal-footer"><span>本次测试可能消耗上游额度</span><div><button type="button" disabled={Boolean(busy)} onClick={() => setTestOpen(false)}>关闭</button><button className="switch" form="test-request-form" type="submit" disabled={Boolean(busy) || loadingModels || !testModel}>{busy === "codex-test" ? "正在发送..." : testResult ? "重试" : "发送测试请求"}</button></div></footer>
-      </section>
-    </div>}
-  </main>;
+      </main>
+
+    <Dialog onOpenChange={(open) => { if (open || !busy) setUpstreamDialogOpen(open); }} open={upstreamDialogOpen}>
+      <DialogContent className="max-h-[calc(100vh-2rem)] overflow-y-auto sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>{editing ? "编辑中转" : "添加中转"}</DialogTitle>
+          <DialogDescription>{editing ? "留空 API Key 即保留本机已有的凭据。" : "凭据仅保存到本机 SQLite，不会发送到页面以外的地方。"}</DialogDescription>
+        </DialogHeader>
+        <form className="grid gap-4" onSubmit={submit}>
+          <label className="grid gap-2 text-sm font-medium">标识符
+            <Input disabled={Boolean(editing)} onChange={(event) => set("id", event.target.value)} pattern="[A-Za-z0-9_-]+" placeholder="provider-a" required value={draft.id} />
+            <span className="text-xs font-normal text-muted-foreground">仅支持字母、数字、连字符和下划线，创建后不可修改。</span>
+          </label>
+          <label className="grid gap-2 text-sm font-medium">名称
+            <Input onChange={(event) => set("name", event.target.value)} placeholder="中转 A" required value={draft.name} />
+          </label>
+          <label className="grid gap-2 text-sm font-medium">OpenAI 兼容基础 URL
+            <Input onChange={(event) => set("apiBase", event.target.value)} placeholder="https://gateway.example.com/v1" required type="url" value={draft.apiBase} />
+          </label>
+          <label className="grid gap-2 text-sm font-medium">API Key
+            <Input onChange={(event) => set("apiKey", event.target.value)} placeholder={editing ? "留空则保留现有 API Key" : "仅保存在本地 SQLite"} required={!editing} type="password" value={draft.apiKey} />
+          </label>
+          <DialogFooter className="pt-2">
+            <Button disabled={Boolean(busy)} onClick={() => setUpstreamDialogOpen(false)} type="button" variant="outline">取消</Button>
+            <Button disabled={Boolean(busy)} type="submit">{busy?.startsWith("edit-") || busy === "create" ? <LoaderCircle className="animate-spin" /> : <Check />}{editing ? "保存更改" : "添加中转"}</Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog onOpenChange={(open) => { if (open || busy !== "codex-test") setTestOpen(open); }} open={testOpen}>
+      <DialogContent className="grid max-h-[calc(100vh-2rem)] gap-0 overflow-visible p-0 sm:max-w-2xl" ref={setTestDialogElement} showCloseButton={busy !== "codex-test"}>
+        {testTarget && <>
+          <DialogHeader className="border-b border-border px-5 py-4 pr-12 sm:px-6">
+            <DialogTitle>测试中转</DialogTitle>
+            <DialogDescription>通过 <code className="font-mono text-xs text-foreground">POST /v1/responses</code> 发送一次真实流式请求。</DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 overflow-y-auto px-5 py-5 sm:px-6">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-secondary/35 p-3">
+              <div className="min-w-0">
+                <p className="font-medium">{testTarget.name}</p>
+                <p className="mt-1 truncate font-mono text-xs text-muted-foreground">{testTarget.apiBase}</p>
+              </div>
+              <Badge variant={activeUpstream?.id === testTarget.id ? "default" : "outline"}>{activeUpstream?.id === testTarget.id ? "当前路由" : "仅测试，不切换"}</Badge>
+            </div>
+            <form className="mt-5 grid gap-4" id="test-request-form" onSubmit={runCodexTest}>
+              <label className="grid gap-2 text-sm font-medium">选择测试模型
+                <ModelPicker disabled={loadingModels || Boolean(modelsError)} models={testModels} onValueChange={setTestModel} portalContainer={testDialogElement} value={testModel} />
+                {loadingModels && <span className="flex items-center gap-1.5 text-xs font-normal text-muted-foreground"><LoaderCircle className="size-3 animate-spin" />正在读取中转模型...</span>}
+                {modelsError && <span className="text-xs font-normal text-destructive">{modelsError}</span>}
+              </label>
+              <label className="grid gap-2 text-sm font-medium">测试消息
+                <Textarea className="min-h-20 resize-y" onChange={(event) => setTestPrompt(event.target.value)} required rows={3} value={testPrompt} />
+              </label>
+            </form>
+            <section aria-live="polite" className="mt-5 rounded-xl border border-slate-700 bg-slate-950 p-4 font-mono text-xs leading-5 text-slate-300">
+              <div className="flex flex-wrap gap-x-5 gap-y-1 border-b border-slate-700 pb-2 text-slate-400">
+                <span>路径 <b className="font-medium text-slate-100">/v1/responses</b></span>
+                <span>模型 <b className="font-medium text-slate-100">{testModel || "等待选择"}</b></span>
+              </div>
+              {busy === "codex-test" ? <div className="pt-3">
+                <p className="text-amber-300">正在实时接收模型文本...</p>
+                <p className="mt-2 whitespace-pre-wrap break-words text-emerald-300">{streamingText || "正在等待第一个文本增量..."}<span className="streaming-cursor" /></p>
+              </div> : testResult ? <div className="pt-3">
+                <p>HTTP 状态 <b className={cn("font-medium", testResult.status >= 200 && testResult.status < 300 ? "text-emerald-300" : "text-red-300")}>{testResult.status}</b></p>
+                <p className="mt-2 whitespace-pre-wrap break-words text-emerald-300">{streamingText || "模型未返回可显示的文本内容。"}</p>
+                <p className="mt-2 text-slate-400">{testResult.truncated ? "响应内容已截断。" : "流式响应已完成。"}</p>
+              </div> : <p className="pt-3 text-slate-400">尚未发送请求，模型文本会在这里实时显示。</p>}
+            </section>
+          </div>
+          <DialogFooter className="border-t border-border bg-secondary/45 px-5 py-4 sm:px-6">
+            <span className="mr-auto text-xs text-muted-foreground">本次测试可能消耗上游额度</span>
+            <Button disabled={busy === "codex-test"} onClick={() => setTestOpen(false)} type="button" variant="outline">关闭</Button>
+            <Button disabled={busy === "codex-test" || loadingModels || !testModel} form="test-request-form" type="submit">{busy === "codex-test" ? <LoaderCircle className="animate-spin" /> : <FlaskConical />}{testResult ? "重新测试" : "发送测试"}</Button>
+          </DialogFooter>
+        </>}
+      </DialogContent>
+    </Dialog>
+
+    <Dialog onOpenChange={setRouteGuideOpen} open={routeGuideOpen}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>路由说明</DialogTitle>
+          <DialogDescription>了解 Codex 请求如何经本机 Gateway 转发到当前中转。</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4 text-sm leading-6 text-muted-foreground">
+          <div className="border-l-2 border-primary pl-3 text-foreground">{status?.notice ?? "正在读取网关状态..."}</div>
+          <div className="flex gap-3"><KeyRound className="mt-1 size-4 shrink-0 text-primary" /><p><strong className="font-medium text-foreground">凭据只留在本机</strong><br />上游 API Key 仅保存在本机 SQLite，管理页、iframe 和 CDP 注入脚本均不会接收该信息。</p></div>
+          <div className="flex gap-3"><RefreshCw className="mt-1 size-4 shrink-0 text-primary" /><p><strong className="font-medium text-foreground">切换只影响后续请求</strong><br />已开始的流会继续由原中转完成，不会被迁移到新的中转。</p></div>
+          <div className="flex gap-3"><Server className="mt-1 size-4 shrink-0 text-primary" /><p><strong className="font-medium text-foreground">请求保持原样</strong><br />Gateway 不改写模型名、请求路径、请求体或 SSE 响应。</p></div>
+        </div>
+        <DialogFooter><Button onClick={() => setRouteGuideOpen(false)} type="button">知道了</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <AlertDialog onOpenChange={(open) => { if (!open && !busy) setActivateTarget(undefined); }} open={Boolean(activateTarget)}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>切换到“{activateTarget?.name}”？</AlertDialogTitle>
+          <AlertDialogDescription>切换只影响后续 Codex 请求。已开始的流会继续由原中转完成，不会迁移或中断。</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={Boolean(busy)}>取消</AlertDialogCancel>
+          <AlertDialogAction disabled={Boolean(busy)} onClick={(event) => {
+            event.preventDefault();
+            if (!activateTarget) return;
+            void run(`activate-${activateTarget.id}`, async () => {
+              const result = await api(`/api/upstreams/${activateTarget.id}/activate`, { method: "POST" });
+              setActivateTarget(undefined);
+              return result;
+            }, `${activateTarget.name} 已设为当前路由。`);
+          }}>{busy?.startsWith("activate-") ? <LoaderCircle className="animate-spin" /> : <Check />}确认切换</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+
+    <AlertDialog onOpenChange={(open) => { if (!open) setDeleteTarget(undefined); }} open={Boolean(deleteTarget)}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>删除中转？</AlertDialogTitle>
+          <AlertDialogDescription>将删除“{deleteTarget?.name}”及其本机保存的 API Key。若它是当前路由，网关将不再转发后续请求。</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={Boolean(busy)}>取消</AlertDialogCancel>
+          <AlertDialogAction className="bg-destructive text-white hover:bg-destructive/90" disabled={Boolean(busy)} onClick={(event) => {
+            event.preventDefault();
+            if (!deleteTarget) return;
+            void run(`delete-${deleteTarget.id}`, async () => {
+              const result = await api(`/api/upstreams/${deleteTarget.id}`, { method: "DELETE" });
+              setDeleteTarget(undefined);
+              return result;
+            }, "中转已删除。");
+          }}>删除</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+      {toastMessage && <Toast key={toastMessage.id} onOpenChange={(open) => { if (!open) setToastMessage(undefined); }} open variant={toastMessage.variant}>
+        {toastMessage.variant === "destructive" ? <CircleAlert className="mt-0.5 size-4 text-destructive" /> : <CircleCheck className="mt-0.5 size-4 text-primary" />}
+        <div>
+          <ToastTitle>{toastMessage.title}</ToastTitle>
+          <ToastDescription>{toastMessage.description}</ToastDescription>
+        </div>
+        <ToastClose />
+      </Toast>}
+      <ToastViewport />
+    </TooltipProvider>
+  </ToastProvider>;
 }
+
 createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);
