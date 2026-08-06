@@ -3,6 +3,7 @@ import { chmod, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/pro
 import os from "node:os";
 import path from "node:path";
 import { parse as parseToml } from "@iarna/toml";
+import { ensurePrivateDirectory, ensurePrivateFile } from "./local-security.js";
 
 const windowsRetryCount = 3;
 const windowsRetryDelayMs = 80;
@@ -379,6 +380,7 @@ async function atomicWrite(filePath: string, content: string, platform: NodeJS.P
     }
     if (platform !== "win32") await chmod(temporaryPath, 0o600);
     await replaceFileWithRetry(temporaryPath, filePath, platform);
+    ensurePrivateFile(filePath);
   } finally {
     await rm(temporaryPath, { force: true }).catch(() => undefined);
   }
@@ -397,6 +399,7 @@ async function backupIfPresent(filePath: string, content: string | null, timesta
   const backupPath = `${filePath}.gateway-backup-${timestamp}`;
   await writeFile(backupPath, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
   if (platform !== "win32") await chmod(backupPath, 0o600);
+  ensurePrivateFile(backupPath);
   return 1;
 }
 
@@ -434,8 +437,7 @@ export async function configureCodex(options: CodexConfigurationOptions): Promis
   const configPath = path.join(codexHome, "config.toml");
   const authPath = path.join(codexHome, "auth.json");
 
-  await mkdir(codexHome, { recursive: true, mode: 0o700 });
-  if (platform !== "win32") await chmod(codexHome, 0o700);
+  ensurePrivateDirectory(codexHome);
 
   const [currentConfig, currentAuth] = await Promise.all([readOptionalText(configPath), readOptionalText(authPath)]);
   const nextConfig = mergeCodexConfig(currentConfig, options.gatewayHost, options.gatewayPort);

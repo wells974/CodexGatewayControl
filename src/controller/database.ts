@@ -1,7 +1,7 @@
-import { chmodSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { config } from "./config.js";
+import { ensurePrivateDirectory, ensurePrivateFile } from "./local-security.js";
 
 export type Upstream = {
   id: string;
@@ -14,10 +14,10 @@ export type Upstream = {
 
 export type PublicUpstream = Omit<Upstream, "apiKey"> & { apiKeyConfigured: boolean };
 
-mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
+ensurePrivateDirectory(config.dataDir);
 const databasePath = path.join(config.dataDir, "gateway.sqlite");
 export const database = new DatabaseSync(databasePath);
-try { chmodSync(databasePath, 0o600); } catch (_) {}
+ensurePrivateFile(databasePath);
 
 database.exec(`
   PRAGMA journal_mode = WAL;

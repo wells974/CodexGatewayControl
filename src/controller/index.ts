@@ -1,8 +1,8 @@
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
 import express, { type NextFunction, type Request, type Response } from "express";
-import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import https from "node:https";
+import selfsigned from "selfsigned";
 import { config, sessionCookieValue } from "./config.js";
 import {
   activeUpstream,
@@ -18,6 +18,7 @@ import {
 } from "./database.js";
 import { proxyRequest } from "./proxy.js";
 import { configureCodex } from "./codex-config.js";
+import { ensurePrivateDirectory, ensurePrivateFile } from "./local-security.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -477,27 +478,35 @@ app.get("/{*path}", (_request, response) => response.sendFile(path.join(webRoot,
 /**
  * 创建或读取仅供本机 Gateway 管理页使用的 TLS 证书。
  * @returns HTTPS 服务所需的私钥和证书文本。
- * @throws 系统缺少 openssl、证书生成失败或生成后的文件无法读取时抛出错误。
- * @remarks 证书和私钥仅存于本地 `.data`；模型代理仍使用 HTTP loopback，不会使用此证书。
+ * @throws 证书生成失败或生成后的文件无法读取时抛出错误。
+ * @remarks 使用 Node 库生成证书，不依赖 macOS/Windows 的 openssl 安装；证书和私钥仅存于本地 `.data`。
  */
-function gatewayTlsCredentials(): { key: Buffer; cert: Buffer } {
-  mkdirSync(config.dataDir, { recursive: true });
+async function gatewayTlsCredentials(): Promise<{ key: Buffer; cert: Buffer }> {
+  ensurePrivateDirectory(config.dataDir);
   if (!existsSync(tlsKeyPath) || !existsSync(tlsCertificatePath)) {
-    execFileSync("openssl", [
-      "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-      "-keyout", tlsKeyPath,
-      "-out", tlsCertificatePath,
-      "-sha256", "-days", "3650",
-      "-subj", "/CN=127.0.0.1",
-      "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"
-    ], { stdio: "ignore" });
+    const generated = await selfsigned.generate(
+        [{ name: "commonName", value: "127.0.0.1" }],
+      {
+        keySize: 2048,
+        notAfterDate: new Date(Date.now() + 3650 * 24 * 60 * 60 * 1000),
+        algorithm: "sha256",
+        extensions: [
+          { name: "basicConstraints", cA: false },
+          { name: "keyUsage", digitalSignature: true, keyEncipherment: true },
+          { name: "extKeyUsage", serverAuth: true },
+          { name: "subjectAltName", altNames: [{ type: 7, ip: "127.0.0.1" }, { type: 2, value: "localhost" }] }
+        ]
+      }
+    );
+    writeFileSync(tlsKeyPath, generated.private, { mode: 0o600 });
+    writeFileSync(tlsCertificatePath, generated.cert, { mode: 0o600 });
   }
-  chmodSync(tlsKeyPath, 0o600);
-  chmodSync(tlsCertificatePath, 0o600);
+  ensurePrivateFile(tlsKeyPath);
+  ensurePrivateFile(tlsCertificatePath);
   return { key: readFileSync(tlsKeyPath), cert: readFileSync(tlsCertificatePath) };
 }
 
-const tlsCredentials = gatewayTlsCredentials();
+const tlsCredentials = await gatewayTlsCredentials();
 const httpServer = app.listen(config.port, config.host, () => console.log(`Codex Gateway 代理已监听 http://${config.host}:${config.port}`));
 const httpsServer = https.createServer(tlsCredentials, app).listen(config.uiTlsPort, config.host, () => {
   console.log(`Codex Gateway 管理页已监听 https://${config.host}:${config.uiTlsPort}`);

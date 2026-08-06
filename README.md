@@ -6,7 +6,7 @@ Gateway 不会修改 Codex 请求中的模型名。无论 Codex 请求 `gpt-4.1`
 
 ## 启动
 
-只需要 Node.js 22.13+。不需要 Docker、Postgres、LiteLLM 或独立数据库服务。
+只需要 Node.js 22.13+。不需要 Docker、Postgres、LiteLLM、OpenSSL 或独立数据库服务。
 
 ```bash
 cp .env.example .env
@@ -72,6 +72,13 @@ npm run codex
 CODEX_CDP_USER_DATA_DIR=/绝对路径/到/codex-gateway-profile npm run codex
 # 或
 npm run codex -- --user-data-dir /绝对路径/到/codex-gateway-profile
+```
+
+Windows launcher 默认尝试 `%LOCALAPPDATA%\\Programs\\ChatGPT\\ChatGPT.exe`；若安装位置不同，在 PowerShell 中指定：
+
+```powershell
+$env:CODEX_APP_PATH = "C:\\你的路径\\ChatGPT.exe"
+npm run codex
 ```
 
 Codex 的 renderer CSP 默认会拦截 `http://127.0.0.1:4000` iframe。launcher 会把 Gateway 的公开 HTML 作为 `blob:` 文档嵌入，启用 CDP CSP bypass、注册 document-start 注入脚本并排除头像和听写等浮层 target；后续 renderer 重建会由常驻守护自动恢复。侧栏会在“插件”下方插入“网关管理”入口；按 `Esc` 或切换到任一原生侧栏页面即可回到 Codex。Controller、HTTPS 管理页和独立 CDP 端口都以环境变量为起点，启动时若遇到占用会自动向后寻找可用端口；实际端口会打印在终端。

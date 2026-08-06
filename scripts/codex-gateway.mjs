@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash, X509Certificate } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdir, readFile } from "node:fs/promises";
 import https from "node:https";
 import net from "node:net";
@@ -24,7 +24,7 @@ function parseArgs(argv) {
     watch: false,
     open: false,
     forceReload: false,
-    appPath: process.env.CODEX_APP_PATH || "/Applications/ChatGPT.app",
+    appPath: process.env.CODEX_APP_PATH || defaultDesktopPath(),
     userDataDir: path.resolve(process.env.CODEX_CDP_USER_DATA_DIR || ".data/codex-cdp-profile")
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -48,6 +48,19 @@ function parseArgs(argv) {
   }
   if (!options.launch && !options.attachExisting) options.launch = true;
   return options;
+}
+
+/**
+ * 根据当前操作系统选择 Codex Desktop 的默认安装位置。
+ * @returns {string} 可供 launcher 尝试启动的应用路径。
+ * @remarks Windows 安装位置可能因商店版或企业部署而异，调用方可通过 `CODEX_APP_PATH` 覆盖。
+ */
+function defaultDesktopPath() {
+  if (process.platform === "win32") {
+    return path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || ".", "Programs", "ChatGPT", "ChatGPT.exe");
+  }
+  if (process.platform === "darwin") return "/Applications/ChatGPT.app";
+  return process.env.CODEX_DESKTOP_EXECUTABLE || "codex";
 }
 
 async function reachable(url, timeoutMs = 1_500) {
@@ -180,6 +193,21 @@ function startController(ports) {
   return child;
 }
 
+/**
+ * 结束 launcher 自己启动的 Controller 进程。
+ * @param {import("node:child_process").ChildProcess} child Controller 子进程。
+ * @returns 无返回值。
+ * @remarks Windows 使用 `taskkill /T` 清理进程树；不会触碰 Docker、LiteLLM 或用户原有 Desktop 进程。
+ */
+function stopController(child) {
+  if (!child?.pid) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    return;
+  }
+  child.kill("SIGTERM");
+}
+
 async function ensureController() {
   const proxyHealthy = await reachable(`${controllerUrl}/health`);
   const uiHealthy = await reachableGatewayUi(`${gatewayUiOrigin}/health`);
@@ -201,7 +229,7 @@ async function ensureController() {
     await waitForGatewayUi(`${gatewayUiOrigin}/health`, 15_000, "Gateway HTTPS 管理页");
     return { child, started: true };
   } catch (error) {
-    child.kill("SIGTERM");
+    stopController(child);
     throw error;
   }
 }
@@ -223,18 +251,20 @@ async function gatewayTlsSpki() {
 }
 
 /**
- * 返回 macOS app bundle 内的主可执行文件路径。
- * @param {string} appPath ChatGPT 或 Codex 的 `.app` bundle 路径。
- * @returns {string} 可由 Node 直接启动的 Electron 主进程路径。
+ * 返回当前平台可直接启动的 Desktop 主进程路径。
+ * @param {string} appPath macOS `.app`、Windows `.exe` 或 Linux 可执行文件路径。
+ * @returns {string} 可由 Node 直接启动的 Desktop 主进程路径。
  * @throws 路径不存在时由后续 `spawn` 以系统错误形式报告。
  */
 function desktopExecutable(appPath) {
-  return path.join(appPath, "Contents", "MacOS", path.basename(appPath, ".app"));
+  if (process.platform === "win32") return appPath.toLowerCase().endsWith(".exe") ? appPath : path.join(appPath, "ChatGPT.exe");
+  if (process.platform === "darwin") return path.join(appPath, "Contents", "MacOS", path.basename(appPath, ".app"));
+  return appPath;
 }
 
 /**
- * 使用独立 profile 启动可调试的 Codex，避免 macOS `open` 将参数转发给已有实例后丢失。
- * @param {string} appPath ChatGPT 或 Codex 的 `.app` bundle 路径。
+ * 使用独立 profile 启动可调试的 Codex，避免系统应用启动器将参数转发给当前已打开的实例。
+ * @param {string} appPath macOS `.app`、Windows `.exe` 或 Linux 可执行文件路径。
  * @param {number} port 仅绑定到 loopback 的 CDP 端口。
  * @param {string} userDataDir 独立实例的持久用户数据目录。
  * @returns {Promise<import("node:child_process").ChildProcess>} 已启动的 Desktop 主进程。
@@ -579,7 +609,7 @@ async function main() {
     if (stopping) return;
     stopping = true;
     states.forEach((state) => state.cdp.close());
-    if (controller?.started && controller.child?.exitCode === null) controller.child.kill("SIGTERM");
+    if (controller?.started && controller.child?.exitCode === null) stopController(controller.child);
     // 此启动器不管理任何外部服务。
   };
   process.once("SIGINT", stop);
