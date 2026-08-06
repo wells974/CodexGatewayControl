@@ -74,7 +74,7 @@ CODEX_CDP_USER_DATA_DIR=/绝对路径/到/codex-gateway-profile npm run codex
 npm run codex -- --user-data-dir /绝对路径/到/codex-gateway-profile
 ```
 
-Codex 的 renderer CSP 默认会拦截 `http://127.0.0.1:4000` iframe。launcher 会把 Gateway 的公开 HTML 作为 `blob:` 文档嵌入，启用 CDP CSP bypass、注册 document-start 注入脚本并排除头像和听写等浮层 target；后续 renderer 重建会由常驻守护自动恢复。侧栏会在“插件”下方插入“网关管理”入口；按 `Esc` 或切换到任一原生侧栏页面即可回到 Codex。
+Codex 的 renderer CSP 默认会拦截 `http://127.0.0.1:4000` iframe。launcher 会把 Gateway 的公开 HTML 作为 `blob:` 文档嵌入，启用 CDP CSP bypass、注册 document-start 注入脚本并排除头像和听写等浮层 target；后续 renderer 重建会由常驻守护自动恢复。侧栏会在“插件”下方插入“网关管理”入口；按 `Esc` 或切换到任一原生侧栏页面即可回到 Codex。Controller、HTTPS 管理页和独立 CDP 端口都以环境变量为起点，启动时若遇到占用会自动向后寻找可用端口；实际端口会打印在终端。
 
 当前本机安装的 ChatGPT Desktop 会在 CDP `Page.reload` 后进入“ChatGPT failed to start / ERR_FAILED (-2)”页面，因此默认不 reload 主 renderer。Taskboard 使用的 CSP bypass + reload 流程不兼容这一个 Desktop 版本。可以仅用于确认兼容性的诊断命令显式开启 reload：
 

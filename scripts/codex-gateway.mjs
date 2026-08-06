@@ -4,14 +4,15 @@ import { createHash, X509Certificate } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, readFile } from "node:fs/promises";
 import https from "node:https";
+import net from "node:net";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import WebSocket from "ws";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const defaultPort = Number(process.env.CODEX_CDP_PORT ?? 9237);
-const controllerUrl = process.env.GATEWAY_ORIGIN ?? "http://127.0.0.1:4000";
-const gatewayUiOrigin = process.env.GATEWAY_UI_ORIGIN ?? `https://127.0.0.1:${Number(process.env.GATEWAY_UI_TLS_PORT ?? 4401)}`;
+let controllerUrl = process.env.GATEWAY_ORIGIN ?? "http://127.0.0.1:4000";
+let gatewayUiOrigin = process.env.GATEWAY_UI_ORIGIN ?? `https://127.0.0.1:${Number(process.env.GATEWAY_UI_TLS_PORT ?? 4401)}`;
 const gatewayTlsCertificatePath = path.join(path.resolve(process.env.GATEWAY_DATA_DIR ?? ".data"), "gateway-ui-cert.pem");
 const injectionPath = path.join(root, "inject", "codex-gateway.user.js");
 
@@ -84,6 +85,50 @@ async function reachableGatewayUi(url, timeoutMs = 1_500) {
   });
 }
 
+/**
+ * 在 loopback 上寻找从指定端口开始的空闲 TCP 端口。
+ * @param {number} preferredPort 优先尝试的端口。
+ * @param {number[]} reservedPorts 本次启动已经预留、不可重复使用的端口。
+ * @returns {Promise<number>} 可绑定的端口号。
+ * @throws 从起始端口连续尝试到上限仍无空闲端口时抛出错误。
+ * @remarks 只绑定 `127.0.0.1` 做探测，探测结束立即释放监听器；实际服务启动仍会处理并报告竞争占用。
+ */
+async function findLoopbackPort(preferredPort, reservedPorts = []) {
+  const firstPort = Number.isInteger(preferredPort) && preferredPort >= 1024 && preferredPort <= 65535
+    ? preferredPort
+    : 4000;
+  const reserved = new Set(reservedPorts);
+  for (let port = firstPort; port <= 65535; port += 1) {
+    if (reserved.has(port)) continue;
+    const available = await new Promise((resolve) => {
+      const server = net.createServer();
+      server.once("error", () => resolve(false));
+      server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
+    });
+    if (available) return port;
+  }
+  throw new Error(`从端口 ${firstPort} 开始没有可用的本机端口。`);
+}
+
+/**
+ * 将本地管理页 origin 替换为 launcher 实际选定的端口。
+ * @param {string} origin 原始 HTTP(S) origin。
+ * @param {number} port 新的 loopback 端口。
+ * @returns {string} 保留协议和主机、仅更新端口后的 origin。
+ * @throws origin 不是有效的 HTTP(S) URL 时抛出错误。
+ */
+function originWithPort(origin, port) {
+  const parsed = new URL(origin);
+  if (!/^https?:$/.test(parsed.protocol) || parsed.hostname !== "127.0.0.1") {
+    throw new Error("Gateway Controller 和管理页必须监听 127.0.0.1。请检查 GATEWAY_ORIGIN/GATEWAY_UI_ORIGIN。");
+  }
+  parsed.port = String(port);
+  parsed.pathname = "";
+  parsed.search = "";
+  parsed.hash = "";
+  return parsed.toString().replace(/\/$/, "");
+}
+
 async function waitFor(url, timeoutMs, label) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -118,9 +163,19 @@ function run(command, args, options = {}) {
   });
 }
 
-function startController() {
+function startController(ports) {
   const entry = path.join(root, "dist-controller", "controller", "index.js");
-  const child = spawn(process.execPath, [entry], { cwd: root, stdio: "inherit" });
+  const child = spawn(process.execPath, [entry], {
+    cwd: root,
+    stdio: "inherit",
+    env: {
+      ...process.env,
+      GATEWAY_HOST: "127.0.0.1",
+      CONTROLLER_HOST: "127.0.0.1",
+      GATEWAY_PORT: String(ports.controllerPort),
+      GATEWAY_UI_TLS_PORT: String(ports.uiTlsPort)
+    }
+  });
   child.once("error", (error) => console.error(`Controller 进程错误：${error.message}`));
   return child;
 }
@@ -129,11 +184,18 @@ async function ensureController() {
   const proxyHealthy = await reachable(`${controllerUrl}/health`);
   const uiHealthy = await reachableGatewayUi(`${gatewayUiOrigin}/health`);
   if (proxyHealthy && uiHealthy) return { child: null, started: false };
-  if (proxyHealthy) {
-    throw new Error(`Gateway HTTP 代理可达，但 HTTPS 管理页 ${gatewayUiOrigin} 不可达。请停止旧 Controller 后重新运行 npm run codex。`);
-  }
+  const controllerOrigin = new URL(controllerUrl);
+  const uiOrigin = new URL(gatewayUiOrigin);
+  const preferredControllerPort = Number(controllerOrigin.port) || 4000;
+  const controllerPort = proxyHealthy
+    ? await findLoopbackPort(preferredControllerPort + 1)
+    : await findLoopbackPort(preferredControllerPort);
+  const uiTlsPort = await findLoopbackPort(Number(uiOrigin.port) || 4401, [controllerPort]);
+  controllerUrl = originWithPort(controllerUrl, controllerPort);
+  gatewayUiOrigin = originWithPort(gatewayUiOrigin, uiTlsPort);
+  console.log(`Gateway 将使用代理端口 ${controllerPort}，管理页 HTTPS 端口 ${uiTlsPort}。`);
   console.log("正在启动本地 Gateway Controller...");
-  const child = startController();
+  const child = startController({ controllerPort, uiTlsPort });
   try {
     await waitFor(`${controllerUrl}/health`, 15_000, "Gateway Controller 服务");
     await waitForGatewayUi(`${gatewayUiOrigin}/health`, 15_000, "Gateway HTTPS 管理页");
@@ -508,7 +570,7 @@ async function reconcileUntilReady(port, source, hash, shouldOpen, states, force
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const cdpVersion = `http://127.0.0.1:${options.port}/json/version`;
+  let cdpVersion = `http://127.0.0.1:${options.port}/json/version`;
   let controller = null;
   const states = new Map();
   let stopping = false;
@@ -529,7 +591,14 @@ async function main() {
     if (options.attachExisting && !cdpAvailable) {
       throw new Error(`无法附加：Codex CDP 未监听 127.0.0.1:${options.port}。请使用 --remote-debugging-port=${options.port} 启动 Codex，或运行 npm run codex 创建独立的 Gateway-enabled 实例。`);
     }
-    if (!cdpAvailable && options.launch) {
+    if (options.launch) {
+      const requestedCdpPort = options.port;
+      const preferredCdpPort = cdpAvailable ? requestedCdpPort + 1 : requestedCdpPort;
+      options.port = await findLoopbackPort(preferredCdpPort);
+      if (options.port !== requestedCdpPort) {
+        console.log(`CDP 端口 ${requestedCdpPort} 已占用，改用 ${options.port}。`);
+      }
+      cdpVersion = `http://127.0.0.1:${options.port}/json/version`;
       await launchCodex(options.appPath, options.port, options.userDataDir);
       await waitFor(cdpVersion, 30_000, `Codex CDP on port ${options.port}`);
     }
