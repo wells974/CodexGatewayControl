@@ -272,7 +272,7 @@ function desktopExecutable(appPath) {
  * @param {string} userDataDir 独立实例的持久用户数据目录。
  * @returns {Promise<import("node:child_process").ChildProcess>} 已提交启动请求的子进程。
  * @throws 创建 profile 目录失败时抛出文件系统错误。
- * @remarks macOS 通过 LaunchServices 启动，以保留 Codex 的 Dock 和菜单栏状态项；不得用当前日常 Codex profile 启动该实例。
+ * @remarks 直接运行 Desktop 主可执行文件，确保 CDP、独立 profile 与 TLS 参数传给同一 Electron 进程；不得用当前日常 Codex profile 启动该实例。
  */
 async function launchCodex(appPath, port, userDataDir) {
   await mkdir(userDataDir, { recursive: true });
@@ -286,10 +286,10 @@ async function launchCodex(appPath, port, userDataDir) {
     "--disable-features=LocalNetworkAccessChecks",
     `--ignore-certificate-errors-spki-list=${tlsSpki}`
   ];
-  const usesLaunchServices = process.platform === "darwin";
-  const child = usesLaunchServices
-    ? spawn("/usr/bin/open", ["-n", appPath, "--args", ...launchArguments], { stdio: "ignore" })
-    : spawn(desktopExecutable(appPath), launchArguments, { stdio: "ignore", detached: true });
+  const child = spawn(desktopExecutable(appPath), launchArguments, {
+    stdio: "ignore",
+    detached: true
+  });
   child.unref();
   return child;
 }
@@ -298,7 +298,7 @@ async function launchCodex(appPath, port, userDataDir) {
  * 查找正在监听指定 CDP 端口的 Codex 主进程。
  * @param {number} port CDP loopback 端口。
  * @returns {{pid: number}|null} 可用于停止的主进程标识；无法确定时返回 null。
- * @remarks 仅在 macOS 通过 LaunchServices 启动后使用，端口由本轮 launcher 自动选择，不会匹配用户普通 Codex 实例。
+ * @remarks 仅在 macOS 直接启动 Desktop 后使用，端口由本轮 launcher 自动选择，不会匹配用户普通 Codex 实例。
  */
 function cdpOwnerProcess(port) {
   if (process.platform !== "darwin") return null;
@@ -311,11 +311,12 @@ function cdpOwnerProcess(port) {
  * 选择可用 CDP 端口并启动一轮独立 Codex。
  * @param {{port: number, appPath: string, userDataDir: string}} options launcher 启动选项。
  * @param {boolean} cdpAlreadyAvailable 首选端口是否已被其他 CDP 实例占用。
+ * @param {(child: import("node:child_process").ChildProcess) => void} onLaunched 子进程创建后立即登记的回调。
  * @returns {Promise<{cdpVersion: string, launchedCodex: {pid: number}|import("node:child_process").ChildProcess}>} 实际 CDP 地址和对应进程。
  * @throws 无可用端口、Codex 启动失败或 CDP 未在时限内监听时抛出错误。
- * @remarks 仅使用本轮独立 profile 的 CDP 端口；端口失效后可安全重新启动，不会附加用户日常 Codex。
+ * @remarks 回调在等待 CDP 前执行，使退出信号能够关闭正在启动中的进程；仅使用本轮独立 profile 的 CDP 端口，不会附加用户日常 Codex。
  */
-async function startCodexWithAvailableCdp(options, cdpAlreadyAvailable) {
+async function startCodexWithAvailableCdp(options, cdpAlreadyAvailable, onLaunched) {
   const requestedCdpPort = options.port;
   const preferredCdpPort = cdpAlreadyAvailable ? requestedCdpPort + 1 : requestedCdpPort;
   options.port = await findLoopbackPort(preferredCdpPort);
@@ -324,6 +325,7 @@ async function startCodexWithAvailableCdp(options, cdpAlreadyAvailable) {
   }
   const cdpVersion = `http://127.0.0.1:${options.port}/json/version`;
   const child = await launchCodex(options.appPath, options.port, options.userDataDir);
+  onLaunched(child);
   await waitFor(cdpVersion, 30_000, `Codex CDP on port ${options.port}`);
   return { cdpVersion, launchedCodex: cdpOwnerProcess(options.port) ?? child };
 }
@@ -682,19 +684,38 @@ async function main() {
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
 
+  /**
+   * 登记刚创建的 Codex 子进程，并处理其创建时已经收到的退出请求。
+   * @param {import("node:child_process").ChildProcess} child 刚由 launcher 创建的独立 Codex 进程。
+   * @returns {void} 进程已登记，或已按退出状态发送结束信号后返回。
+   * @remarks 必须在等待 CDP 前调用，避免退出与 watcher 重启之间遗漏新进程。
+   */
+  function registerLaunchedCodex(child) {
+    launchedCodex = child;
+    if (stopping) stopLaunchedCodex(child);
+  }
+
   try {
     controller = await ensureController();
+    if (stopping) return;
     const cdpAvailable = await reachable(cdpVersion);
+    if (stopping) return;
     if (options.attachExisting && !cdpAvailable) {
       throw new Error(`无法附加：Codex CDP 未监听 127.0.0.1:${options.port}。请使用 --remote-debugging-port=${options.port} 启动 Codex，或运行 npm run codex 创建独立的 Gateway-enabled 实例。`);
     }
     if (options.launch) {
-      const started = await startCodexWithAvailableCdp(options, cdpAvailable);
+      const started = await startCodexWithAvailableCdp(options, cdpAvailable, registerLaunchedCodex);
+      if (stopping) {
+        stopLaunchedCodex(started.launchedCodex);
+        return;
+      }
       cdpVersion = started.cdpVersion;
       launchedCodex = started.launchedCodex;
     }
     await waitForCodexTarget(options.port, 30_000);
+    if (stopping) return;
     let current = await currentSource();
+    if (stopping) return;
     if (options.forceReload) console.log("已启用首次 renderer reload，以让 CSP bypass 对 Gateway iframe 生效。");
     const first = await reconcileUntilReady(
       options.port,
@@ -709,17 +730,26 @@ async function main() {
 
     while (!stopping) {
       await new Promise((resolve) => setTimeout(resolve, 2_000));
+      if (stopping) break;
       try {
         if (!(await reachable(`${controllerUrl}/health`))) {
           controller = await ensureController();
         }
-        if (options.launch && !(await reachable(cdpVersion))) {
+        if (stopping) break;
+        const cdpReachable = await reachable(cdpVersion);
+        if (stopping) break;
+        if (options.launch && !cdpReachable) {
           states.forEach((state) => state.cdp.close());
           states.clear();
-          const restarted = await startCodexWithAvailableCdp(options, false);
+          const restarted = await startCodexWithAvailableCdp(options, false, registerLaunchedCodex);
+          if (stopping) {
+            stopLaunchedCodex(restarted.launchedCodex);
+            break;
+          }
           cdpVersion = restarted.cdpVersion;
           launchedCodex = restarted.launchedCodex;
           await waitForCodexTarget(options.port, 30_000);
+          if (stopping) break;
           const restartedTargets = await reconcileUntilReady(
             options.port,
             current.source,
@@ -728,10 +758,12 @@ async function main() {
             states,
             options.forceReload,
           );
+          if (stopping) break;
           console.log(JSON.stringify({ restarted: restartedTargets }, null, 2));
           continue;
         }
         const latest = await currentSource();
+        if (stopping) break;
         current = latest;
         const results = await reconcile(options.port, latest.source, latest.hash, false, states, options.forceReload);
         if (results.length) console.log(JSON.stringify({ reconciled: results }, null, 2));
