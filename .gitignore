@@ -9,3 +9,5 @@ release/
 .data/
 *.log
 .idea/
+tmp/
+.DS_Store
