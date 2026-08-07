@@ -1,11 +1,11 @@
 {
   "name": "codex-gateway-control",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "main": "desktop/main.cjs",
   "description": "Codex 本地 Gateway 管理工具",
-  "author": "Codex Gateway Control",
+  "author": "wells974",
   "engines": {
     "node": ">=22"
   },
@@ -54,10 +54,12 @@
       { "from": "packaging/node-runtime", "to": "node-runtime" }
     ],
     "win": {
+      "icon": "desktop/assets/cgc-app-icon.ico",
       "target": [{ "target": "nsis", "arch": ["x64"] }],
       "artifactName": "CodexGatewayControl-${version}-win-${arch}.${ext}"
     },
     "mac": {
+      "icon": "desktop/assets/cgc-app-icon.icns",
       "target": [{ "target": "dmg", "arch": ["x64", "arm64"] }],
       "artifactName": "CodexGatewayControl-${version}-mac-${arch}.${ext}"
     },

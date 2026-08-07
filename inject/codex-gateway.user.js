@@ -527,8 +527,6 @@
     document.removeEventListener("click", onDocumentClick, true);
     document.removeEventListener("keydown", onKeyDown, true);
     window.removeEventListener("message", onFrameMessage);
-    window.removeEventListener("popstate", closeGateway);
-    window.removeEventListener("hashchange", closeGateway);
     restoreNativePage();
     document.querySelectorAll(`[${OWNED}="true"]`).forEach((node) => node.remove());
     if (window[SENTINEL] === api) delete window[SENTINEL];
@@ -575,8 +573,7 @@
   document.addEventListener("click", onDocumentClick, true);
   document.addEventListener("keydown", onKeyDown, true);
   window.addEventListener("message", onFrameMessage);
-  window.addEventListener("popstate", closeGateway);
-  window.addEventListener("hashchange", closeGateway);
+  // Codex 会在会话状态同步时自行触发 history 事件；原生侧栏点击已由捕获监听处理，不能把任意路由事件当成离开 Gateway。
   observer = new MutationObserver(scheduleRefresh);
   const observerOptions = {
     childList: true,

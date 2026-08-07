@@ -270,24 +270,81 @@ function desktopExecutable(appPath) {
  * @param {string} appPath macOS `.app`、Windows `.exe` 或 Linux 可执行文件路径。
  * @param {number} port 仅绑定到 loopback 的 CDP 端口。
  * @param {string} userDataDir 独立实例的持久用户数据目录。
- * @returns {Promise<import("node:child_process").ChildProcess>} 已启动的 Desktop 主进程。
+ * @returns {Promise<import("node:child_process").ChildProcess>} 已提交启动请求的子进程。
  * @throws 创建 profile 目录失败时抛出文件系统错误。
- * @remarks 仅为隔离 profile 关闭本地网络检查，并只信任 Gateway 证书的精确 SPKI 指纹；不得用当前日常 Codex profile 启动该实例。
+ * @remarks macOS 通过 LaunchServices 启动，以保留 Codex 的 Dock 和菜单栏状态项；不得用当前日常 Codex profile 启动该实例。
  */
 async function launchCodex(appPath, port, userDataDir) {
   await mkdir(userDataDir, { recursive: true });
   const tlsSpki = await gatewayTlsSpki();
   console.log(`正在 CDP 端口 ${port} 启动独立的 Gateway-enabled Codex 实例...`);
   console.log(`独立 Codex profile：${userDataDir}`);
-  const child = spawn(desktopExecutable(appPath), [
+  const launchArguments = [
     `--user-data-dir=${userDataDir}`,
     `--remote-debugging-port=${port}`,
     `--remote-allow-origins=http://127.0.0.1:${port}`,
     "--disable-features=LocalNetworkAccessChecks",
     `--ignore-certificate-errors-spki-list=${tlsSpki}`
-  ], { stdio: "ignore", detached: true });
+  ];
+  const usesLaunchServices = process.platform === "darwin";
+  const child = usesLaunchServices
+    ? spawn("/usr/bin/open", ["-n", appPath, "--args", ...launchArguments], { stdio: "ignore" })
+    : spawn(desktopExecutable(appPath), launchArguments, { stdio: "ignore", detached: true });
   child.unref();
   return child;
+}
+
+/**
+ * 查找正在监听指定 CDP 端口的 Codex 主进程。
+ * @param {number} port CDP loopback 端口。
+ * @returns {{pid: number}|null} 可用于停止的主进程标识；无法确定时返回 null。
+ * @remarks 仅在 macOS 通过 LaunchServices 启动后使用，端口由本轮 launcher 自动选择，不会匹配用户普通 Codex 实例。
+ */
+function cdpOwnerProcess(port) {
+  if (process.platform !== "darwin") return null;
+  const result = spawnSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+  const pid = Number(result.stdout.trim().split("\n")[0]);
+  return Number.isInteger(pid) && pid > 0 ? { pid } : null;
+}
+
+/**
+ * 选择可用 CDP 端口并启动一轮独立 Codex。
+ * @param {{port: number, appPath: string, userDataDir: string}} options launcher 启动选项。
+ * @param {boolean} cdpAlreadyAvailable 首选端口是否已被其他 CDP 实例占用。
+ * @returns {Promise<{cdpVersion: string, launchedCodex: {pid: number}|import("node:child_process").ChildProcess}>} 实际 CDP 地址和对应进程。
+ * @throws 无可用端口、Codex 启动失败或 CDP 未在时限内监听时抛出错误。
+ * @remarks 仅使用本轮独立 profile 的 CDP 端口；端口失效后可安全重新启动，不会附加用户日常 Codex。
+ */
+async function startCodexWithAvailableCdp(options, cdpAlreadyAvailable) {
+  const requestedCdpPort = options.port;
+  const preferredCdpPort = cdpAlreadyAvailable ? requestedCdpPort + 1 : requestedCdpPort;
+  options.port = await findLoopbackPort(preferredCdpPort);
+  if (options.port !== requestedCdpPort) {
+    console.log(`CDP 端口 ${requestedCdpPort} 已占用，改用 ${options.port}。`);
+  }
+  const cdpVersion = `http://127.0.0.1:${options.port}/json/version`;
+  const child = await launchCodex(options.appPath, options.port, options.userDataDir);
+  await waitFor(cdpVersion, 30_000, `Codex CDP on port ${options.port}`);
+  return { cdpVersion, launchedCodex: cdpOwnerProcess(options.port) ?? child };
+}
+
+/**
+ * 结束 launcher 自己启动的独立 Codex 进程组。
+ * @param {{pid: number}|import("node:child_process").ChildProcess|null} child 由 launcher 启动的 Codex 主进程。
+ * @returns {void} 结束信号发送后返回。
+ * @remarks macOS/Linux 使用 detached 进程组，Windows 使用 taskkill 递归清理；不会触碰用户手动启动的 Codex。
+ */
+function stopLaunchedCodex(child) {
+  if (!child?.pid) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch (_) {
+    try { process.kill(child.pid, "SIGTERM"); } catch (_) { /* 进程已退出。 */ }
+  }
 }
 
 class CdpConnection {
@@ -601,10 +658,17 @@ async function reconcileUntilReady(port, source, hash, shouldOpen, states, force
   throw lastError;
 }
 
+/**
+ * 启动 Controller 协作、Codex 注入以及持续监控循环。
+ * @returns {Promise<void>} 非 watch 模式完成首轮注入后返回；watch 模式在收到终止信号后返回。
+ * @throws 启动参数、Controller、Codex CDP 或注入流程不可用时抛出错误。
+ * @remarks watch 模式会在独立 Codex 被关闭后自动重新启动新实例，不会影响已开始的 Gateway 流。
+ */
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   let cdpVersion = `http://127.0.0.1:${options.port}/json/version`;
   let controller = null;
+  let launchedCodex = null;
   const states = new Map();
   let stopping = false;
 
@@ -613,7 +677,7 @@ async function main() {
     stopping = true;
     states.forEach((state) => state.cdp.close());
     if (controller?.started && controller.child?.exitCode === null) stopController(controller.child);
-    // 此启动器不管理任何外部服务。
+    stopLaunchedCodex(launchedCodex);
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
@@ -625,15 +689,9 @@ async function main() {
       throw new Error(`无法附加：Codex CDP 未监听 127.0.0.1:${options.port}。请使用 --remote-debugging-port=${options.port} 启动 Codex，或运行 npm run codex 创建独立的 Gateway-enabled 实例。`);
     }
     if (options.launch) {
-      const requestedCdpPort = options.port;
-      const preferredCdpPort = cdpAvailable ? requestedCdpPort + 1 : requestedCdpPort;
-      options.port = await findLoopbackPort(preferredCdpPort);
-      if (options.port !== requestedCdpPort) {
-        console.log(`CDP 端口 ${requestedCdpPort} 已占用，改用 ${options.port}。`);
-      }
-      cdpVersion = `http://127.0.0.1:${options.port}/json/version`;
-      await launchCodex(options.appPath, options.port, options.userDataDir);
-      await waitFor(cdpVersion, 30_000, `Codex CDP on port ${options.port}`);
+      const started = await startCodexWithAvailableCdp(options, cdpAvailable);
+      cdpVersion = started.cdpVersion;
+      launchedCodex = started.launchedCodex;
     }
     await waitForCodexTarget(options.port, 30_000);
     let current = await currentSource();
@@ -654,6 +712,24 @@ async function main() {
       try {
         if (!(await reachable(`${controllerUrl}/health`))) {
           controller = await ensureController();
+        }
+        if (options.launch && !(await reachable(cdpVersion))) {
+          states.forEach((state) => state.cdp.close());
+          states.clear();
+          const restarted = await startCodexWithAvailableCdp(options, false);
+          cdpVersion = restarted.cdpVersion;
+          launchedCodex = restarted.launchedCodex;
+          await waitForCodexTarget(options.port, 30_000);
+          const restartedTargets = await reconcileUntilReady(
+            options.port,
+            current.source,
+            current.hash,
+            options.open,
+            states,
+            options.forceReload,
+          );
+          console.log(JSON.stringify({ restarted: restartedTargets }, null, 2));
+          continue;
         }
         const latest = await currentSource();
         current = latest;

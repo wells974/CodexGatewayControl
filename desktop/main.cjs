@@ -1,4 +1,4 @@
-const { app, Menu, nativeImage, shell, Tray, dialog } = require("electron");
+const { app, BrowserWindow, Menu, nativeImage, shell, Tray, dialog } = require("electron");
 const { existsSync } = require("node:fs");
 const { spawn, spawnSync } = require("node:child_process");
 const os = require("node:os");
@@ -11,12 +11,12 @@ const singleInstance = app.requestSingleInstanceLock();
 const preferredControllerPort = Number(process.env.GATEWAY_PORT ?? process.env.CONTROLLER_PORT ?? 4000);
 const preferredUiTlsPort = Number(process.env.GATEWAY_UI_TLS_PORT ?? 4401);
 let tray = null;
+let keepAliveWindow = null;
 let controller = null;
 let launcher = null;
 let stopping = false;
 let controllerOrigin = null;
 let gatewayUiOrigin = null;
-let startupPromise = null;
 
 /**
  * 返回不包含人为添加空格目录名的安装版用户数据根目录。
@@ -186,6 +186,9 @@ function startLauncher(controllerPort, uiTlsPort, dataDirectory) {
   child.once("error", (error) => {
     if (!stopping) dialog.showErrorBox("Codex 启动失败", error.message);
   });
+  child.once("exit", () => {
+    if (launcher === child) launcher = null;
+  });
   return child;
 }
 
@@ -215,25 +218,97 @@ function stopChild(child) {
 }
 
 /**
+ * 等待指定的 Electron 受管子进程退出。
+ * @param {import("node:child_process").ChildProcess|null} child 需要等待的子进程。
+ * @param {number} timeoutMs 最大等待时间。
+ * @returns {Promise<boolean>} 子进程在时限内退出时返回 true，否则返回 false。
+ * @remarks 只观察 Electron 自己创建的 Controller 或 launcher，不会探测或操作外部进程。
+ */
+function waitForChildExit(child, timeoutMs = 3_000) {
+  if (!child?.pid || child.exitCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (exited) => {
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
+/**
+ * 结束并确认 Electron 自己启动的子进程已经退出。
+ * @param {import("node:child_process").ChildProcess|null} child 需要结束的 Controller 或 launcher。
+ * @returns {Promise<void>} 退出信号完成处理后返回。
+ * @remarks 常规 SIGTERM 超时后仅对本子进程发送 SIGKILL，避免 CGC 退出后遗留 Node 进程。
+ */
+async function stopChildAndWait(child) {
+  stopChild(child);
+  if (await waitForChildExit(child)) return;
+  if (child?.pid && process.platform !== "win32") child.kill("SIGKILL");
+  await waitForChildExit(child, 1_000);
+}
+
+/**
+ * 重启 launcher 并创建新的 Gateway-enabled Codex 实例。
+ * @returns {Promise<void>} 旧 launcher 结束且新 launcher 创建后返回。
+ * @throws Gateway 尚未完成启动时抛出错误。
+ * @remarks 先结束旧 watcher，防止两个 launcher 对同一独立 profile 或 CDP 端口竞争。
+ */
+async function restartLauncher() {
+  if (!controllerOrigin || !gatewayUiOrigin) throw new Error("Gateway 尚未准备完成。");
+  const previous = launcher;
+  launcher = null;
+  await stopChildAndWait(previous);
+  if (stopping) return;
+  launcher = startLauncher(
+    Number(new URL(controllerOrigin).port),
+    Number(new URL(gatewayUiOrigin).port),
+    path.join(userDataRoot(), "data")
+  );
+}
+
+/**
  * 创建托盘入口并绑定常用操作。
  * @returns {void} 托盘菜单创建完成后返回。
  */
 function createTray() {
-  const icon = nativeImage.createFromDataURL("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'><rect width='32' height='32' rx='7' fill='%235b5cf0'/><path d='M8 16h16M16 8v16' stroke='white' stroke-width='3' stroke-linecap='round'/></svg>");
+  const iconName = "cgc-tray-template.png";
+  const sourceIcon = nativeImage.createFromPath(path.join(__dirname, "assets", iconName));
+  if (sourceIcon.isEmpty()) throw new Error("无法加载菜单栏图标资源。");
+  const icon = sourceIcon.resize({ width: 18, height: 18, quality: "best" });
+  if (process.platform === "darwin") icon.setTemplateImage(true);
   tray = new Tray(icon);
   tray.setToolTip("Codex Gateway Control");
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: "打开管理页", click: () => void openManagementPage() },
-    { label: "启动 Codex", click: () => { if (!launcher) launcher = startLauncher(Number(new URL(controllerOrigin).port), Number(new URL(gatewayUiOrigin).port), path.join(userDataRoot(), "data")); } },
+    { label: "启动 Codex", click: () => void restartLauncher().catch((error) => dialog.showErrorBox("Codex 启动失败", error.message)) },
     { type: "separator" },
     { label: "退出", click: () => app.quit() }
   ]));
 }
 
 /**
- * 启动 Gateway、管理页和可选 Codex 注入流程。
+ * 创建不可见的保活窗口，确保无 BrowserWindow 的菜单栏应用不会被 macOS 自动结束。
+ * @returns {void} 保活窗口创建完成后返回。
+ * @remarks 窗口不加载页面、不出现在 Dock 或任务栏，用户仅通过菜单栏托盘与应用交互。
+ */
+function createKeepAliveWindow() {
+  keepAliveWindow = new BrowserWindow({
+    show: false,
+    skipTaskbar: true,
+    width: 1,
+    height: 1,
+    webPreferences: { sandbox: true }
+  });
+}
+
+/**
+ * 启动 Gateway 和可选 Codex 注入流程。
  * @returns {Promise<void>} 所有本地服务初始化完成后结束。
- * @throws 端口、Node runtime、Controller 或浏览器打开失败时抛出错误。
+ * @throws 端口、Node runtime 或 Controller 启动失败时抛出错误。
  */
 async function startApplication() {
   const root = userDataRoot();
@@ -244,24 +319,27 @@ async function startApplication() {
   gatewayUiOrigin = `https://127.0.0.1:${uiTlsPort}`;
   controller = startController(controllerPort, uiTlsPort, dataDirectory);
   await waitForHealth(`${controllerOrigin}/health`);
-  createTray();
-  await openManagementPage();
   launcher = startLauncher(controllerPort, uiTlsPort, dataDirectory);
 }
 
 if (!singleInstance) {
   app.quit();
 } else {
-  app.on("second-instance", () => void (startupPromise ? startupPromise.then(openManagementPage) : openManagementPage()));
-  app.on("before-quit", () => {
+  app.on("window-all-closed", (event) => event.preventDefault());
+  app.on("before-quit", (event) => {
+    if (stopping) return;
+    event.preventDefault();
     stopping = true;
-    stopChild(launcher);
-    stopChild(controller);
-    tray?.destroy();
+    void Promise.all([stopChildAndWait(launcher), stopChildAndWait(controller)]).finally(() => {
+      tray?.destroy();
+      keepAliveWindow?.destroy();
+      app.exit(0);
+    });
   });
   app.whenReady().then(() => {
-    startupPromise = startApplication();
-    return startupPromise;
+    createKeepAliveWindow();
+    createTray();
+    return startApplication();
   }).catch((error) => {
     dialog.showErrorBox("Codex Gateway Control 启动失败", error instanceof Error ? error.message : String(error));
     app.quit();
