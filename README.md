@@ -15,7 +15,7 @@ npm run build
 npm start
 ```
 
-打开启动日志中显示的本机管理地址，添加每个 OpenAI 兼容中转的 URL 和 API Key，测试后点击“使用此中转”。Gateway 默认从 HTTP 端口 4000 和管理页 HTTPS 端口 4401 开始；端口被占用时会自动向后选择空闲端口，实际地址以启动日志或管理页状态为准。数据保存在本地 `.data/gateway.sqlite`，文件权限仅允许当前用户访问。管理 API 不会返回 API Key，嵌入式浏览器页面也无法访问它。
+打开启动日志中显示的本机管理地址，添加每个 OpenAI 兼容中转的 URL 和 API Key，测试后点击“使用此中转”。Gateway HTTP 代理端口默认使用 4000，并会在首次成功启动后固定保存，因为该地址会写入 Codex 的 `config.toml`；后续若被占用会明确报错，不会静默改到其他端口。管理页 HTTPS 端口默认从 4401 开始，仍会自动向后选择空闲端口。数据保存在本地 `.data/gateway.sqlite`，文件权限仅允许当前用户访问。管理 API 不会返回 API Key，嵌入式浏览器页面也无法访问它。
 
 Codex 内嵌管理页使用独立的 HTTPS loopback 地址。这是为了让 `blob:app://-` iframe 能使用浏览器自动携带的 `HttpOnly; Secure; Partitioned` 本地会话 Cookie；模型代理地址仍使用 Controller 实际选定的本机 HTTP 端口。首次启动会在 `.data/` 生成仅本机使用的自签名证书和私钥，二者均不会提交或发送到浏览器页面。
 
@@ -28,6 +28,8 @@ Model: 当前中转支持的任意模型名
 ```
 
 Gateway 会使用保存的上游 API Key 向中转发请求，不会将它暴露给 Codex 或浏览器。
+
+如果需要主动更换 HTTP 代理端口，请通过 `GATEWAY_PORT` 设置新端口，启动 Gateway 后在管理页执行“一键配置”，再重启 Codex。安装版发现既定本机地址不可用时会提供“自动修复并继续”：应用会选择可用地址、备份并更新 Codex 设置，然后继续启动；只有自动更新设置失败时，才会打开管理页要求点击“一键配置”。
 
 ## 构建安装包
 
@@ -100,7 +102,7 @@ $env:CODEX_APP_PATH = "C:\\你的路径\\ChatGPT.exe"
 npm run codex
 ```
 
-Codex 的 renderer CSP 默认会拦截本机 Gateway iframe。launcher 会把 Gateway 的公开 HTML 作为 `blob:` 文档嵌入，启用 CDP CSP bypass、注册 document-start 注入脚本并排除头像和听写等浮层 target；后续 renderer 重建会由常驻守护自动恢复。侧栏会在“插件”下方插入“网关管理”入口；按 `Esc` 或切换到任一原生侧栏页面即可回到 Codex。Controller、HTTPS 管理页和独立 CDP 端口都以环境变量为起点，启动时若遇到占用会自动向后寻找可用端口；实际端口会打印在终端。
+Codex 的 renderer CSP 默认会拦截本机 Gateway iframe。launcher 会把 Gateway 的公开 HTML 作为 `blob:` 文档嵌入，启用 CDP CSP bypass、注册 document-start 注入脚本并排除头像和听写等浮层 target；后续 renderer 重建会由常驻守护自动恢复。侧栏会在“插件”下方插入“网关管理”入口；按 `Esc` 或切换到任一原生侧栏页面即可回到 Codex。HTTP 代理端口会保持首次确定的值；HTTPS 管理页和独立 CDP 端口以环境变量为起点，遇到占用时会自动寻找可用端口。实际地址会打印在终端。
 
 当前本机安装的 ChatGPT Desktop 会在 CDP `Page.reload` 后进入“ChatGPT failed to start / ERR_FAILED (-2)”页面，因此默认不 reload 主 renderer。Taskboard 使用的 CSP bypass + reload 流程不兼容这一个 Desktop 版本。可以仅用于确认兼容性的诊断命令显式开启 reload：
 

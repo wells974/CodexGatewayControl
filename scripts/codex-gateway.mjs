@@ -2,7 +2,7 @@
 
 import { createHash, X509Certificate } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import https from "node:https";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
@@ -16,9 +16,12 @@ const defaultControllerPort = Number(process.env.GATEWAY_PORT ?? process.env.CON
 const defaultUiTlsPort = Number(process.env.GATEWAY_UI_TLS_PORT ?? 4401);
 let controllerUrl = process.env.GATEWAY_ORIGIN ?? `http://127.0.0.1:${defaultControllerPort}`;
 let gatewayUiOrigin = process.env.GATEWAY_UI_ORIGIN ?? `https://127.0.0.1:${defaultUiTlsPort}`;
-const gatewayTlsCertificatePath = path.join(path.resolve(process.env.GATEWAY_DATA_DIR ?? ".data"), "gateway-ui-cert.pem");
+const gatewayDataDirectory = path.resolve(process.env.GATEWAY_DATA_DIR ?? ".data");
+const gatewayTlsCertificatePath = path.join(gatewayDataDirectory, "gateway-ui-cert.pem");
 const injectionPath = path.resolve(process.env.CODEX_INJECTION_PATH ?? path.join(root, "inject", "codex-gateway.user.js"));
 const controllerEntryPath = path.resolve(process.env.GATEWAY_CONTROLLER_ENTRY ?? path.join(root, "dist-controller", "controller", "index.js"));
+const controllerPortIsExplicit = Boolean(process.env.GATEWAY_ORIGIN || process.env.GATEWAY_PORT || process.env.CONTROLLER_PORT);
+const gatewayPortStatePath = path.join(gatewayDataDirectory, "gateway-port.json");
 
 function parseArgs(argv) {
   const options = {
@@ -103,6 +106,73 @@ async function reachableGatewayUi(url, timeoutMs = 1_500) {
 }
 
 /**
+ * 判断值是否可作为 Gateway 的稳定本机端口。
+ * @param {unknown} value 待校验的端口值。
+ * @returns {boolean} 值为 1024 到 65535 的整数时返回 true。
+ * @remarks 与 Controller 端口状态格式保持一致，避免读取损坏状态后绑定无效端口。
+ */
+function isGatewayPort(value) {
+  return Number.isInteger(value) && value >= 1024 && value <= 65535;
+}
+
+/**
+ * 读取 launcher 保存的 Gateway 稳定端口状态。
+ * @returns {Promise<{controllerPort: number, codexConfigurationRequired: boolean}|null>} 有效状态；不存在或无效时返回 null。
+ * @remarks 状态文件仅保存本机端口和迁移标记，不保存认证材料或上游配置。
+ */
+async function readGatewayPortState() {
+  try {
+    const value = JSON.parse(await readFile(gatewayPortStatePath, "utf8"));
+    if (!isGatewayPort(value?.controllerPort) || typeof value.codexConfigurationRequired !== "boolean") return null;
+    return { controllerPort: value.controllerPort, codexConfigurationRequired: value.codexConfigurationRequired };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 保存首次成功使用的 Gateway 代理端口。
+ * @param {number} controllerPort 已启动并通过健康检查的代理端口。
+ * @returns {Promise<void>} 状态文件成功替换后完成。
+ * @throws 数据目录或状态文件无法创建、写入或替换时抛出错误。
+ * @remarks 仅在未设置显式环境变量且状态不存在时调用，不会覆盖一键配置写入的迁移标记。
+ */
+async function persistInitialControllerPort(controllerPort) {
+  if (controllerPortIsExplicit || !isGatewayPort(controllerPort)) return;
+  if (await readGatewayPortState()) return;
+  await mkdir(gatewayDataDirectory, { recursive: true, mode: 0o700 });
+  const temporaryPath = `${gatewayPortStatePath}.${process.pid}.tmp`;
+  await writeFile(temporaryPath, `${JSON.stringify({ controllerPort, codexConfigurationRequired: false })}\n`, { encoding: "utf8", mode: 0o600 });
+  await rename(temporaryPath, gatewayPortStatePath);
+}
+
+/**
+ * 返回本轮必须使用的 Gateway HTTP 代理端口。
+ * @returns {Promise<number>} 显式环境变量、已持久化状态或默认地址中的稳定端口。
+ * @throws Controller 地址格式无效时由 URL 构造函数抛出异常。
+ * @remarks HTTP 代理地址会写入 Codex config.toml，因此不使用自动递增端口策略。
+ */
+async function stableControllerPort() {
+  const configuredPort = Number(new URL(controllerUrl).port) || 4000;
+  if (controllerPortIsExplicit) return configuredPort;
+  return (await readGatewayPortState())?.controllerPort ?? configuredPort;
+}
+
+/**
+ * 检查指定 loopback 端口是否可被当前进程绑定。
+ * @param {number} port 待检查的 TCP 端口。
+ * @returns {Promise<boolean>} 可绑定时返回 true。
+ * @remarks 检查完成即释放监听器，实际 Controller 仍会处理极小竞争窗口中的绑定失败。
+ */
+async function canBindLoopbackPort(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
+  });
+}
+
+/**
  * 在 loopback 上寻找从指定端口开始的空闲 TCP 端口。
  * @param {number} preferredPort 优先尝试的端口。
  * @param {number[]} reservedPorts 本次启动已经预留、不可重复使用的端口。
@@ -117,11 +187,7 @@ async function findLoopbackPort(preferredPort, reservedPorts = []) {
   const reserved = new Set(reservedPorts);
   for (let port = firstPort; port <= 65535; port += 1) {
     if (reserved.has(port)) continue;
-    const available = await new Promise((resolve) => {
-      const server = net.createServer();
-      server.once("error", () => resolve(false));
-      server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
-    });
+    const available = await canBindLoopbackPort(port);
     if (available) return port;
   }
   throw new Error(`从端口 ${firstPort} 开始没有可用的本机端口。`);
@@ -212,17 +278,22 @@ function stopController(child) {
 }
 
 async function ensureController() {
+  const controllerPort = await stableControllerPort();
+  controllerUrl = originWithPort(controllerUrl, controllerPort);
   const proxyHealthy = await reachable(`${controllerUrl}/health`);
   const uiHealthy = await reachableGatewayUi(`${gatewayUiOrigin}/health`);
-  if (proxyHealthy && uiHealthy) return { child: null, started: false };
-  const controllerOrigin = new URL(controllerUrl);
+  if (proxyHealthy && uiHealthy) {
+    await persistInitialControllerPort(controllerPort);
+    return { child: null, started: false };
+  }
+  if (proxyHealthy) {
+    throw new Error(`Gateway 代理端口 ${controllerPort} 已有正在运行的服务，但管理页不可用。为避免 Codex 配置指向错误端口，本次不会自动更换代理端口；请重启现有 Gateway 或释放该端口后重试。`);
+  }
+  if (!(await canBindLoopbackPort(controllerPort))) {
+    throw new Error(`Gateway 代理端口 ${controllerPort} 已被其他本地程序占用。Codex config.toml 可能仍指向该端口，本次不会自动更换；请释放端口，或显式设置 GATEWAY_PORT 后重新执行一键配置。`);
+  }
   const uiOrigin = new URL(gatewayUiOrigin);
-  const preferredControllerPort = Number(controllerOrigin.port) || 4000;
-  const controllerPort = proxyHealthy
-    ? await findLoopbackPort(preferredControllerPort + 1)
-    : await findLoopbackPort(preferredControllerPort);
   const uiTlsPort = await findLoopbackPort(Number(uiOrigin.port) || 4401, [controllerPort]);
-  controllerUrl = originWithPort(controllerUrl, controllerPort);
   gatewayUiOrigin = originWithPort(gatewayUiOrigin, uiTlsPort);
   console.log(`Gateway 将使用代理端口 ${controllerPort}，管理页 HTTPS 端口 ${uiTlsPort}。`);
   console.log("正在启动本地 Gateway Controller...");
@@ -230,6 +301,7 @@ async function ensureController() {
   try {
     await waitFor(`${controllerUrl}/health`, 15_000, "Gateway Controller 服务");
     await waitForGatewayUi(`${gatewayUiOrigin}/health`, 15_000, "Gateway HTTPS 管理页");
+    await persistInitialControllerPort(controllerPort);
     return { child, started: true };
   } catch (error) {
     stopController(child);

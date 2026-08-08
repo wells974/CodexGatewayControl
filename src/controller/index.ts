@@ -18,6 +18,7 @@ import {
 } from "./database.js";
 import { proxyRequest } from "./proxy.js";
 import { configureCodex } from "./codex-config.js";
+import { markCodexConfigurationCurrent } from "./gateway-port-state.js";
 import { ensurePrivateDirectory, ensurePrivateFile } from "./local-security.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +32,7 @@ app.disable("x-powered-by");
 const codexEmbedOrigin = "app://-";
 const tlsKeyPath = path.join(config.dataDir, "gateway-ui-key.pem");
 const tlsCertificatePath = path.join(config.dataDir, "gateway-ui-cert.pem");
+let automaticCodexConfigurationError: string | null = null;
 
 /**
  * 判断请求来源是否是本机管理页或受支持的 Codex blob 嵌入页。
@@ -128,7 +130,7 @@ function publicStatus() {
   const active = activeUpstream();
   return {
     gateway: { healthy: true, baseUrl: `http://${config.host}:${config.port}`, proxyPath: "/v1/*" },
-    codexConfiguration: { available: Boolean(config.accessToken.trim()) },
+    codexConfiguration: { available: Boolean(config.accessToken.trim()), automaticMigrationError: automaticCodexConfigurationError },
     activeUpstream: active ? { id: active.id, name: active.name, apiBase: active.apiBase } : null,
     upstreams: listUpstreams().map((upstream) => ({ ...upstream, ...probes.get(upstream.id) })),
     notice: "网关会将每个 Codex 请求原样转发到当前中转，不改写模型名或流式响应。切换只影响后续请求。"
@@ -155,6 +157,27 @@ function publicCodexConfigurationError(error: unknown): string {
 }
 
 /**
+ * 在用户确认端口迁移后，将 Codex 配置安全同步到新的本机 Gateway 地址。
+ * @returns 自动配置成功或失败后完成，不向上抛出配置错误。
+ * @remarks 仅接受桌面主进程在用户确认后设置的环境标记；失败时保留迁移状态并启动管理页，避免在旧地址下启动 Codex。
+ */
+async function configureCodexAfterConfirmedPortMigration(): Promise<void> {
+  if (process.env.GATEWAY_AUTO_CONFIGURE_CODEX !== "true") return;
+  try {
+    await configureCodex({
+      accessToken: config.accessToken,
+      gatewayHost: "127.0.0.1",
+      gatewayPort: config.port
+    });
+    markCodexConfigurationCurrent(config.dataDir, config.port);
+    console.log("已自动更新 Codex 的本机 Gateway 设置。");
+  } catch (error) {
+    automaticCodexConfigurationError = publicCodexConfigurationError(error);
+    console.error("无法自动更新 Codex 的本机 Gateway 设置，已保留管理页供手动完成配置。");
+  }
+}
+
+/**
  * 将当前用户的 Codex 全局配置安全切换到本地 Gateway。
  * @param _request 已通过本地会话校验的管理请求。
  * @param response Express 响应对象。
@@ -163,11 +186,20 @@ function publicCodexConfigurationError(error: unknown): string {
  */
 async function configureLocalCodex(_request: Request, response: Response): Promise<void> {
   try {
-    response.json(await configureCodex({
+    const result = await configureCodex({
       accessToken: config.accessToken,
       gatewayHost: "127.0.0.1",
       gatewayPort: config.port
-    }));
+    });
+    try {
+      markCodexConfigurationCurrent(config.dataDir, config.port);
+      response.json(result);
+    } catch {
+      response.json({
+        ...result,
+        message: "Codex 已配置为使用本地 Gateway，但未能保存启动状态。请在重启 Gateway 后再次执行一键配置。"
+      });
+    }
   } catch (error) {
     response.status(400).json({ error: publicCodexConfigurationError(error) });
   }
@@ -506,6 +538,7 @@ async function gatewayTlsCredentials(): Promise<{ key: Buffer; cert: Buffer }> {
   return { key: readFileSync(tlsKeyPath), cert: readFileSync(tlsCertificatePath) };
 }
 
+await configureCodexAfterConfirmedPortMigration();
 const tlsCredentials = await gatewayTlsCredentials();
 const httpServer = app.listen(config.port, config.host, () => console.log(`Codex Gateway 代理已监听 http://${config.host}:${config.port}`));
 const httpsServer = https.createServer(tlsCredentials, app).listen(config.uiTlsPort, config.host, () => {

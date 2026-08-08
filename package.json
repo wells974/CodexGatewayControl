@@ -26,7 +26,7 @@
     "gateway:codex": "npm run codex",
     "codex:attach": "npm run build && node scripts/codex-gateway.mjs --attach-existing --watch --open",
     "gateway": "npm start",
-    "test": "tsx --test src/controller/codex-config.test.ts"
+    "test": "tsx --test src/controller/*.test.ts"
   },
   "dependencies": {
     "@iarna/toml": "^2.2.5",

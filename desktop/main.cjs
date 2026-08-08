@@ -1,5 +1,5 @@
 const { app, BrowserWindow, Menu, nativeImage, shell, Tray, dialog } = require("electron");
-const { existsSync } = require("node:fs");
+const { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } = require("node:fs");
 const { spawn, spawnSync } = require("node:child_process");
 const os = require("node:os");
 const path = require("node:path");
@@ -10,6 +10,7 @@ app.setPath("userData", userDataRoot());
 const singleInstance = app.requestSingleInstanceLock();
 const preferredControllerPort = Number(process.env.GATEWAY_PORT ?? process.env.CONTROLLER_PORT ?? 4000);
 const preferredUiTlsPort = Number(process.env.GATEWAY_UI_TLS_PORT ?? 4401);
+const controllerPortIsExplicit = Boolean(process.env.GATEWAY_PORT || process.env.CONTROLLER_PORT);
 let tray = null;
 let keepAliveWindow = null;
 let controller = null;
@@ -53,6 +54,75 @@ function nodeExecutable() {
 }
 
 /**
+ * 判断值是否可作为 Gateway 的稳定本机端口。
+ * @param {unknown} value 待校验的端口值。
+ * @returns {boolean} 值为 1024 到 65535 的整数时返回 true。
+ * @remarks 排除特权端口和损坏状态，避免应用启动到无法写入 Codex 配置的地址。
+ */
+function isGatewayPort(value) {
+  return Number.isInteger(value) && value >= 1024 && value <= 65535;
+}
+
+/**
+ * 返回 Gateway 端口状态文件路径。
+ * @param {string} dataDirectory Gateway 私密数据目录。
+ * @returns {string} 状态文件的绝对路径。
+ * @remarks 文件只保存稳定代理端口和配置迁移标记，不包含令牌或中转信息。
+ */
+function gatewayPortStatePath(dataDirectory) {
+  return path.join(dataDirectory, "gateway-port.json");
+}
+
+/**
+ * 读取已保存的 Gateway 稳定端口状态。
+ * @param {string} dataDirectory Gateway 私密数据目录。
+ * @returns {{controllerPort: number, codexConfigurationRequired: boolean}|null} 有效状态；不存在或格式不正确时返回 null。
+ * @remarks 格式错误时回退到默认端口，并在首次迁移前要求用户明确确认。
+ */
+function readGatewayPortState(dataDirectory) {
+  const statePath = gatewayPortStatePath(dataDirectory);
+  if (!existsSync(statePath)) return null;
+  try {
+    const value = JSON.parse(readFileSync(statePath, "utf8"));
+    if (!isGatewayPort(value?.controllerPort) || typeof value.codexConfigurationRequired !== "boolean") return null;
+    return { controllerPort: value.controllerPort, codexConfigurationRequired: value.codexConfigurationRequired };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 原子保存 Gateway 的稳定端口状态。
+ * @param {string} dataDirectory Gateway 私密数据目录。
+ * @param {{controllerPort: number, codexConfigurationRequired: boolean}} state 需要持久化的端口和迁移标记。
+ * @returns {void} 状态文件替换完成后返回。
+ * @throws 端口无效或文件系统无法写入时抛出错误。
+ * @remarks 使用同目录临时文件替换，避免桌面应用中断时写出不完整 JSON。
+ */
+function writeGatewayPortState(dataDirectory, state) {
+  if (!isGatewayPort(state.controllerPort)) throw new Error("本地 Gateway 端口无效，无法保存启动状态。");
+  mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
+  const statePath = gatewayPortStatePath(dataDirectory);
+  const temporaryPath = `${statePath}.${process.pid}.tmp`;
+  writeFileSync(temporaryPath, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600, flag: "w" });
+  renameSync(temporaryPath, statePath);
+}
+
+/**
+ * 检查指定 loopback 端口是否可由当前应用绑定。
+ * @param {number} port 待检查的 TCP 端口。
+ * @returns {Promise<boolean>} 可绑定时返回 true。
+ * @remarks 探测监听器会立即关闭；真正的 Controller 仍负责处理极小竞争窗口内的失败。
+ */
+async function canBindLoopbackPort(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
+  });
+}
+
+/**
  * 将本机端口探测为可绑定的 loopback 端口。
  * @param {number} preferredPort 优先尝试的端口。
  * @param {number[]} reservedPorts 需要跳过的已选端口。
@@ -67,14 +137,79 @@ async function findLoopbackPort(preferredPort, reservedPorts = [], fallbackPort 
   const reserved = new Set(reservedPorts);
   for (let port = firstPort; port <= 65535; port += 1) {
     if (reserved.has(port)) continue;
-    const available = await new Promise((resolve) => {
-      const server = net.createServer();
-      server.once("error", () => resolve(false));
-      server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
-    });
+    const available = await canBindLoopbackPort(port);
     if (available) return port;
   }
   throw new Error(`从端口 ${firstPort} 开始没有可用的本机端口。`);
+}
+
+/**
+ * 选择本轮必须使用的稳定 Gateway HTTP 代理端口。
+ * @param {string} dataDirectory Gateway 私密数据目录。
+ * @returns {Promise<{controllerPort: number, codexConfigurationRequired: boolean, initialized: boolean, autoConfigureCodex: boolean}|null>} 已确认端口及自动修复标记；用户取消时返回 null。
+ * @throws 显式端口或已保存端口被占用时抛出错误。
+ * @remarks 已配置过 Codex 的端口绝不静默递增；仅首次无状态且用户确认自动修复后才会选择新端口。
+ */
+async function selectStableControllerPort(dataDirectory) {
+  if (controllerPortIsExplicit && !isGatewayPort(preferredControllerPort)) {
+    throw new Error("GATEWAY_PORT 必须是 1024 到 65535 之间的整数。");
+  }
+  const previousState = readGatewayPortState(dataDirectory);
+  const saved = controllerPortIsExplicit ? null : previousState;
+  const controllerPort = controllerPortIsExplicit
+    ? preferredControllerPort
+    : saved?.controllerPort ?? (isGatewayPort(preferredControllerPort) ? preferredControllerPort : 4000);
+  if (await canBindLoopbackPort(controllerPort)) {
+    const configurationChanged = controllerPortIsExplicit && Boolean(previousState && previousState.controllerPort !== controllerPort);
+    return {
+      controllerPort,
+      codexConfigurationRequired: configurationChanged || saved?.codexConfigurationRequired === true,
+      initialized: !previousState && !controllerPortIsExplicit,
+      autoConfigureCodex: false
+    };
+  }
+  if (controllerPortIsExplicit) {
+    throw new Error(`Gateway 代理端口 ${controllerPort} 已被其他本地程序占用。Codex config.toml 可能仍指向该端口，本次不会自动更换；请释放端口后重试。`);
+  }
+  const selection = await dialog.showMessageBox({
+    type: "warning",
+    buttons: ["自动修复并继续", "暂不启动"],
+    defaultId: 0,
+    cancelId: 1,
+    title: "需要调整本机连接",
+    message: "Gateway 暂时无法使用默认连接地址。",
+    detail: "这通常是因为另一款本地软件正在使用该地址。选择“自动修复并继续”后，应用会自动选择可用地址、更新 Codex 设置并继续启动，无需关闭或排查其他应用。"
+  });
+  if (selection.response !== 0) return null;
+  const replacementPort = await findLoopbackPort(controllerPort + 1, [], 4000);
+  writeGatewayPortState(dataDirectory, { controllerPort: replacementPort, codexConfigurationRequired: true });
+  return { controllerPort: replacementPort, codexConfigurationRequired: true, initialized: false, autoConfigureCodex: true };
+}
+
+/**
+ * 保存首次成功启动的默认 Gateway 代理端口。
+ * @param {string} dataDirectory Gateway 私密数据目录。
+ * @param {number} controllerPort 已通过健康检查的代理端口。
+ * @returns {void} 初始状态存在或写入完成后返回。
+ * @throws 状态文件无法写入时抛出错误。
+ * @remarks 不覆盖已存在的迁移标记，也不持久化由环境变量显式指定的端口。
+ */
+function persistInitialControllerPort(dataDirectory, controllerPort) {
+  if (controllerPortIsExplicit || readGatewayPortState(dataDirectory)) return;
+  writeGatewayPortState(dataDirectory, { controllerPort, codexConfigurationRequired: false });
+}
+
+/**
+ * 判断当前稳定端口是否尚未同步到 Codex 配置。
+ * @param {string} dataDirectory Gateway 私密数据目录。
+ * @param {number} controllerPort 当前正在监听的 Gateway 代理端口。
+ * @returns {boolean} 需要用户执行一键配置时返回 true。
+ * @remarks 每次启动 Codex 前重新读取状态，使管理页完成配置后无需重启 Gateway 应用。
+ */
+function codexConfigurationRequired(dataDirectory, controllerPort) {
+  const state = readGatewayPortState(dataDirectory);
+  if (!state) return false;
+  return state.codexConfigurationRequired || (controllerPortIsExplicit && state.controllerPort !== controllerPort);
 }
 
 /**
@@ -125,10 +260,11 @@ function desktopExecutable(appPath) {
  * @param {number} controllerPort HTTP 代理端口。
  * @param {number} uiTlsPort HTTPS 管理页端口。
  * @param {string} dataDirectory 私密数据目录。
+ * @param {boolean} autoConfigureCodex 用户确认端口迁移后是否自动同步 Codex 设置。
  * @returns {import("node:child_process").ChildProcess} 已启动的 Controller 子进程。
  * @throws 内置 Node 或 Controller 入口不存在时抛出错误。
  */
-function startController(controllerPort, uiTlsPort, dataDirectory) {
+function startController(controllerPort, uiTlsPort, dataDirectory, autoConfigureCodex = false) {
   const runtime = runtimeRoot();
   const entry = path.join(runtime, "controller.mjs");
   if (app.isPackaged && (!existsSync(nodeExecutable()) || !existsSync(entry))) {
@@ -145,7 +281,8 @@ function startController(controllerPort, uiTlsPort, dataDirectory) {
       GATEWAY_PORT: String(controllerPort),
       GATEWAY_UI_TLS_PORT: String(uiTlsPort),
       GATEWAY_DATA_DIR: dataDirectory,
-      GATEWAY_WEB_DIR: path.join(runtime, "dist-web")
+      GATEWAY_WEB_DIR: path.join(runtime, "dist-web"),
+      GATEWAY_AUTO_CONFIGURE_CODEX: autoConfigureCodex ? "true" : ""
     }
   });
   child.once("error", (error) => {
@@ -259,6 +396,17 @@ async function stopChildAndWait(child) {
  */
 async function restartLauncher() {
   if (!controllerOrigin || !gatewayUiOrigin) throw new Error("Gateway 尚未准备完成。");
+  const dataDirectory = path.join(userDataRoot(), "data");
+  if (codexConfigurationRequired(dataDirectory, Number(new URL(controllerOrigin).port))) {
+    await openManagementPage();
+    await dialog.showMessageBox({
+      type: "warning",
+      title: "需要更新 Codex 配置",
+      message: "Gateway 代理端口已更换，尚未同步到 Codex。",
+      detail: "请在已打开的管理页执行“一键配置”，然后重启 Codex。"
+    });
+    return;
+  }
   const previous = launcher;
   launcher = null;
   await stopChildAndWait(previous);
@@ -266,7 +414,7 @@ async function restartLauncher() {
   launcher = startLauncher(
     Number(new URL(controllerOrigin).port),
     Number(new URL(gatewayUiOrigin).port),
-    path.join(userDataRoot(), "data")
+    dataDirectory
   );
 }
 
@@ -313,12 +461,28 @@ function createKeepAliveWindow() {
 async function startApplication() {
   const root = userDataRoot();
   const dataDirectory = path.join(root, "data");
-  const controllerPort = await findLoopbackPort(preferredControllerPort);
+  const selection = await selectStableControllerPort(dataDirectory);
+  if (!selection) {
+    app.quit();
+    return;
+  }
+  const controllerPort = selection.controllerPort;
   const uiTlsPort = await findLoopbackPort(preferredUiTlsPort, [controllerPort], 4401);
   controllerOrigin = `http://127.0.0.1:${controllerPort}`;
   gatewayUiOrigin = `https://127.0.0.1:${uiTlsPort}`;
-  controller = startController(controllerPort, uiTlsPort, dataDirectory);
+  controller = startController(controllerPort, uiTlsPort, dataDirectory, selection.autoConfigureCodex);
   await waitForHealth(`${controllerOrigin}/health`);
+  if (selection.initialized) persistInitialControllerPort(dataDirectory, controllerPort);
+  if (codexConfigurationRequired(dataDirectory, controllerPort)) {
+    await openManagementPage();
+    await dialog.showMessageBox({
+      type: "warning",
+      title: selection.autoConfigureCodex ? "无法完成自动修复" : "需要完成设置更新",
+      message: selection.autoConfigureCodex ? "Gateway 已准备好，但未能自动更新 Codex 设置。" : "Gateway 的本机连接设置尚未同步到 Codex。",
+      detail: "已打开管理页。请点击“一键配置”完成更新，然后再从菜单栏启动 Codex。"
+    });
+    return;
+  }
   launcher = startLauncher(controllerPort, uiTlsPort, dataDirectory);
 }
 
