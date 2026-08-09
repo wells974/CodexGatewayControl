@@ -789,15 +789,20 @@ async function main() {
     let current = await currentSource();
     if (stopping) return;
     if (options.forceReload) console.log("已启用首次 renderer reload，以让 CSP bypass 对 Gateway iframe 生效。");
-    const first = await reconcileUntilReady(
-      options.port,
-      current.source,
-      current.hash,
-      options.open,
-      states,
-      options.forceReload,
-    );
-    console.log(JSON.stringify({ injected: first }, null, 2));
+    try {
+      const first = await reconcileUntilReady(
+        options.port,
+        current.source,
+        current.hash,
+        options.open,
+        states,
+        options.forceReload,
+      );
+      console.log(JSON.stringify({ injected: first }, null, 2));
+    } catch (error) {
+      if (!options.watch) throw error;
+      console.error(`Gateway 首轮注入尚未完成，将在 Codex 继续启动时重试：${error instanceof Error ? error.message : String(error)}`);
+    }
     if (!options.watch) return;
 
     while (!stopping) {
@@ -837,7 +842,8 @@ async function main() {
         const latest = await currentSource();
         if (stopping) break;
         current = latest;
-        const results = await reconcile(options.port, latest.source, latest.hash, false, states, options.forceReload);
+        const shouldOpenGateway = options.open && ![...states.values()].some((state) => state.opened);
+        const results = await reconcile(options.port, latest.source, latest.hash, shouldOpenGateway, states, options.forceReload);
         if (results.length) console.log(JSON.stringify({ reconciled: results }, null, 2));
       } catch (error) {
         if (!stopping) console.error(`Gateway 启动器正在等待 Codex：${error.message}`);
