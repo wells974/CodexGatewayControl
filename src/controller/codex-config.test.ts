@@ -76,14 +76,12 @@ test("合并配置保留模型、当前 provider 标识和无关设置，并可�
   assert.equal(second.includes("codex_gateway_control"), false);
 });
 
-test("没有 model_provider 时创建并选择 codex_gateway provider", () => {
+test("没有 model_provider 时保持内置 provider 且不新建 model_providers", () => {
   const configured = mergeCodexConfig('model = "gpt-5.6"\n', "127.0.0.1", 4000);
-  assert.match(configured, /model_provider = "codex_gateway"/);
-  assert.match(configured, /\[model_providers\.codex_gateway\]/);
-  assert.match(configured, /base_url = "http:\/\/127\.0\.0\.1:4000\/v1"/);
-  assert.match(configured, /wire_api = "responses"/);
-  assert.match(configured, /requires_openai_auth = true/);
-  assert.equal(configured.includes("openai_base_url"), false);
+  assert.match(configured, /model = "gpt-5\.6"/);
+  assert.match(configured, /openai_base_url = "http:\/\/127\.0\.0\.1:4000\/v1"/);
+  assert.equal(configured.includes("model_provider"), false);
+  assert.equal(configured.includes("[model_providers."), false);
 });
 
 test("内置 openai provider 保持名称并使用 openai_base_url", () => {
@@ -91,6 +89,12 @@ test("内置 openai provider 保持名称并使用 openai_base_url", () => {
   assert.match(configured, /model_provider = "openai"/);
   assert.match(configured, /openai_base_url = "http:\/\/127\.0\.0\.1:4000\/v1"/);
   assert.equal(configured.includes("[model_providers.openai]"), false);
+});
+
+test("用户确认的自定义基础地址会写入当前 provider 且不改变 provider 名称", () => {
+  const configured = mergeCodexConfig('model_provider = "openai"\n', "127.0.0.1", 4000, "https://gateway.example.com/v1");
+  assert.match(configured, /model_provider = "openai"/);
+  assert.match(configured, /openai_base_url = "https:\/\/gateway\.example\.com\/v1"/);
 });
 
 test("已有自定义 provider 保持名称并切换为 Gateway 认证", () => {
@@ -149,7 +153,7 @@ test("一键配置创建备份且不返回或写出接口外的敏感信息", as
   }
 });
 
-test("配置文件不存在时创建 codex_gateway provider 与本地认证", async () => {
+test("配置文件不存在时保留内置 provider 并创建本地认证", async () => {
   const directory = await temporaryCodexHome();
   await rm(directory, { force: true, recursive: true });
   try {
@@ -162,8 +166,9 @@ test("配置文件不存在时创建 codex_gateway provider 与本地认证", as
     const config = await readTemporaryFile(directory, "config.toml");
     const auth = JSON.parse(await readTemporaryFile(directory, "auth.json")) as Record<string, unknown>;
     assert.equal(result.backupsCreated, 0);
-    assert.match(config, /model_provider = "codex_gateway"/);
-    assert.match(config, /\[model_providers\.codex_gateway\]/);
+    assert.match(config, /openai_base_url = "http:\/\/127\.0\.0\.1:4000\/v1"/);
+    assert.equal(config.includes("model_provider"), false);
+    assert.equal(config.includes("[model_providers."), false);
     assert.equal(auth.OPENAI_API_KEY, "local-gateway-token");
   } finally {
     await rm(directory, { force: true, recursive: true });

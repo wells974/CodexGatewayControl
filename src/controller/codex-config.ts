@@ -7,8 +7,6 @@ import { ensurePrivateDirectory, ensurePrivateFile } from "./local-security.js";
 
 const windowsRetryCount = 3;
 const windowsRetryDelayMs = 80;
-const gatewayProviderId = "codex_gateway";
-const gatewayProviderName = "Codex Gateway";
 
 type PathApi = Pick<typeof path, "join" | "resolve">;
 type JsonObject = Record<string, unknown>;
@@ -24,6 +22,7 @@ export type CodexConfigurationOptions = {
   accessToken: string;
   gatewayHost: string;
   gatewayPort: number;
+  gatewayBaseUrl?: string;
   codexHome?: string;
   environment?: NodeJS.ProcessEnv;
   homeDirectory?: string;
@@ -277,21 +276,6 @@ function removeProviderSubtable(content: string, providerId: string, tableName: 
 }
 
 /**
- * 在 TOML 末尾创建供 Gateway 使用的自定义 provider 表。
- * @param content 当前 TOML 文本。
- * @param providerId 新建 provider 标识。
- * @param baseUrl Gateway 的 Responses API 基础地址。
- * @returns 含新 provider 表的 TOML 文本。
- * @remarks 调用方须先确认同名 provider 表不存在，避免覆盖用户已有配置。
- */
-function appendGatewayProvider(content: string, providerId: string, baseUrl: string): string {
-  const lineEnding = content.includes("\r\n") ? "\r\n" : "\n";
-  const prefix = content && !content.endsWith("\n") && !content.endsWith("\r") ? lineEnding : "";
-  const separator = content ? lineEnding : "";
-  return `${content}${prefix}${separator}[model_providers.${providerId}]${lineEnding}name = ${tomlString(gatewayProviderName)}${lineEnding}base_url = ${tomlString(baseUrl)}${lineEnding}wire_api = "responses"${lineEnding}requires_openai_auth = true${lineEnding}`;
-}
-
-/**
  * 将一个已有自定义 provider 的地址和认证方式切换为本机 Gateway。
  * @param content 当前 TOML 文本。
  * @param providerId 保持不变的现有 provider 标识。
@@ -317,10 +301,11 @@ function configureExistingProvider(content: string, providerId: string, baseUrl:
  * @param current 当前 config.toml 文本；null 表示文件尚不存在。
  * @param gatewayHost 本地 Gateway 监听地址。
  * @param gatewayPort 本地 Gateway 监听端口。
+ * @param gatewayBaseUrl 用户确认写入的 Gateway API 基础地址；未提供时由地址和端口生成。
  * @returns 已通过 TOML 语法校验的配置文本。
  * @throws 现有配置不合法或当前自定义 provider 不存在时抛出中文错误。
  */
-export function mergeCodexConfig(current: string | null, gatewayHost: string, gatewayPort: number): string {
+export function mergeCodexConfig(current: string | null, gatewayHost: string, gatewayPort: number, gatewayBaseUrl?: string): string {
   if (!Number.isInteger(gatewayPort) || gatewayPort < 1 || gatewayPort > 65_535) throw new Error("本地 Gateway 端口无效，未执行配置。");
   if (!gatewayHost || /[\r\n]/.test(gatewayHost)) throw new Error("本地 Gateway 地址无效，未执行配置。");
   const existing = current ?? "";
@@ -328,7 +313,7 @@ export function mergeCodexConfig(current: string | null, gatewayHost: string, ga
   const currentProvider = typeof parsed.model_provider === "string" && parsed.model_provider.trim()
     ? parsed.model_provider.trim()
     : null;
-  const baseUrl = `http://${gatewayHost}:${gatewayPort}/v1`;
+  const baseUrl = gatewayBaseUrl ?? `http://${gatewayHost}:${gatewayPort}/v1`;
   let merged = existing;
   merged = setRootString(merged, "preferred_auth_method", "apikey");
   merged = setRootString(merged, "cli_auth_credentials_store", "file");
@@ -337,10 +322,8 @@ export function mergeCodexConfig(current: string | null, gatewayHost: string, ga
   } else if (currentProvider) {
     merged = configureExistingProvider(merged, currentProvider, baseUrl);
   } else {
-    merged = setRootString(merged, "model_provider", gatewayProviderId);
-    merged = providerTableParts(merged, gatewayProviderId)
-      ? configureExistingProvider(merged, gatewayProviderId, baseUrl)
-      : appendGatewayProvider(merged, gatewayProviderId, baseUrl);
+    // 未显式指定 provider 时，Codex 使用内置 openai；只更新其顶层地址，避免创建或改名 provider 导致会话丢失。
+    merged = setRootString(merged, "openai_base_url", baseUrl);
   }
   validateToml(merged, "生成的");
   return merged;
@@ -426,7 +409,7 @@ async function restoreOriginal(filePath: string, original: string | null, platfo
 
 /**
  * 安全地将当前机器的 Codex 全局配置切换为本地 Gateway。
- * @param options Gateway 地址、访问令牌及可测试的目录和平台覆盖项。
+ * @param options Gateway 地址、可选的用户确认 API 地址、访问令牌及可测试的目录和平台覆盖项。
  * @returns 不含路径和凭据的一键配置结果。
  * @throws 输入、现有配置或文件系统失败时抛出中文错误；已替换的文件会尽力回滚。
  */
@@ -440,7 +423,7 @@ export async function configureCodex(options: CodexConfigurationOptions): Promis
   ensurePrivateDirectory(codexHome);
 
   const [currentConfig, currentAuth] = await Promise.all([readOptionalText(configPath), readOptionalText(authPath)]);
-  const nextConfig = mergeCodexConfig(currentConfig, options.gatewayHost, options.gatewayPort);
+  const nextConfig = mergeCodexConfig(currentConfig, options.gatewayHost, options.gatewayPort, options.gatewayBaseUrl);
   const nextAuth = mergeAuthConfig(currentAuth, options.accessToken);
   const timestamp = `${backupTimestamp()}-${randomUUID()}`;
   const backupsCreated = (await backupIfPresent(configPath, currentConfig, timestamp, platform))
