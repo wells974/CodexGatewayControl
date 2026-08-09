@@ -34,6 +34,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Command,
   CommandEmpty,
@@ -69,7 +70,7 @@ type Upstream = {
 };
 type Status = {
   gateway: { healthy: boolean; baseUrl: string };
-  codexConfiguration: { available: boolean };
+  codexConfiguration: { available: boolean; automaticMigrationError: string | null };
   activeUpstream: Pick<Upstream, "id" | "name" | "apiBase"> | null;
   upstreams: Upstream[];
   notice: string;
@@ -79,6 +80,11 @@ type TestTarget = Pick<Upstream, "id" | "name" | "apiBase">;
 type TestResult = { endpoint: "/v1/responses"; stream: boolean; status: number; outputText: string | null; truncated: boolean };
 type ModelList = { models: string[] };
 type ToastMessage = { id: number; title: string; description: string; variant: "default" | "destructive" };
+type ConfigurationPreview = {
+  software: { provider: string; model: string | null; currentBaseUrl: string | null; plannedBaseUrl: string };
+  image: { currentBaseUrl: string | null; currentApiKeyConfigured: boolean; gatewayApiKeyAvailable: boolean; plannedBaseUrl: string; persistence: string };
+};
+type ConfigurationSelection = { software: boolean; image: boolean; softwareBaseUrl: string; imageBaseUrl: string; softwareApiKey: string; imageApiKey: string };
 
 const emptyDraft: Draft = { id: "", name: "", apiBase: "", apiKey: "" };
 
@@ -185,6 +191,22 @@ function App() {
   const [activateTarget, setActivateTarget] = useState<Upstream>();
   const [routeGuideOpen, setRouteGuideOpen] = useState(false);
   const [codexConfigurationDialogOpen, setCodexConfigurationDialogOpen] = useState(false);
+  const [configurationPreview, setConfigurationPreview] = useState<ConfigurationPreview>();
+  const [configurationPreviewError, setConfigurationPreviewError] = useState<string>();
+  const [configurationLogSource, setConfigurationLogSource] = useState("");
+  const [configurationTypedLength, setConfigurationTypedLength] = useState(0);
+  const [configurationStreamComplete, setConfigurationStreamComplete] = useState(false);
+  const [configurationCompletionMessage, setConfigurationCompletionMessage] = useState<string>();
+  const [softwareConfigurationSelected, setSoftwareConfigurationSelected] = useState(true);
+  const [imageConfigurationSelected, setImageConfigurationSelected] = useState(true);
+  const [softwareBaseUrl, setSoftwareBaseUrl] = useState("");
+  const [imageBaseUrl, setImageBaseUrl] = useState("");
+  const [softwareApiKey, setSoftwareApiKey] = useState("");
+  const [imageApiKey, setImageApiKey] = useState("");
+  const [editingSoftwareBaseUrl, setEditingSoftwareBaseUrl] = useState(false);
+  const [editingImageBaseUrl, setEditingImageBaseUrl] = useState(false);
+  const [editingSoftwareApiKey, setEditingSoftwareApiKey] = useState(false);
+  const [editingImageApiKey, setEditingImageApiKey] = useState(false);
   const [busy, setBusy] = useState<string>();
   const [toastMessage, setToastMessage] = useState<ToastMessage>();
   const [testModel, setTestModel] = useState("");
@@ -230,6 +252,49 @@ function App() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  /**
+   * 在打开确认框时读取不含凭据的当前配置摘要。
+   * @returns 无返回值。
+   * @remarks 摘要接口受 HttpOnly 本地会话保护，页面只接收 provider、模型和目标地址。
+   */
+  useEffect(() => {
+    if (!codexConfigurationDialogOpen || busy === "codex-configure") return;
+    setConfigurationPreview(undefined);
+    setConfigurationPreviewError(undefined);
+    void api<ConfigurationPreview>("/api/codex/configuration-preview")
+      .then((preview) => {
+        setConfigurationPreview(preview);
+        setSoftwareBaseUrl(preview.software.plannedBaseUrl);
+        setImageBaseUrl(preview.image.plannedBaseUrl);
+        setSoftwareApiKey("");
+        setImageApiKey("");
+        setEditingSoftwareBaseUrl(false);
+        setEditingImageBaseUrl(false);
+        setEditingSoftwareApiKey(false);
+        setEditingImageApiKey(false);
+      })
+      .catch((error) => setConfigurationPreviewError(error instanceof Error ? error.message : String(error)));
+  }, [codexConfigurationDialogOpen, busy]);
+
+  /**
+   * 将服务端阶段日志逐字写入终端区域，并在最后一个字符出现后显示成功反馈并解除忙碌状态。
+   * @returns 清理当前字符计时器的函数，或无需清理时返回 undefined。
+   * @remarks 仅动画展示服务端已过滤的安全文本，不会处理或显示认证材料。
+   */
+  useEffect(() => {
+    if (configurationTypedLength < configurationLogSource.length) {
+      const timer = window.setTimeout(() => setConfigurationTypedLength((current) => current + 1), 14);
+      return () => window.clearTimeout(timer);
+    }
+    if (configurationStreamComplete && busy === "codex-configure") {
+      if (configurationCompletionMessage) {
+        notify("default", configurationCompletionMessage);
+        setConfigurationCompletionMessage(undefined);
+      }
+      setBusy(undefined);
+    }
+  }, [busy, configurationCompletionMessage, configurationLogSource, configurationStreamComplete, configurationTypedLength]);
 
   /** 更新弹窗表单中的单个中转字段。 */
   const set = (key: keyof Draft, value: string) => setDraft((current) => ({ ...current, [key]: value }));
@@ -287,14 +352,89 @@ function App() {
   /**
    * 确认后请求 Controller 写入当前用户的 Codex 配置。
    * @returns 无返回值。
-   * @remarks 浏览器不会接收或持有用于 auth.json 的本地 Gateway 令牌。
+   * @remarks 浏览器不会接收或持有本地 Gateway 令牌；用户主动填写的自定义密钥仅随本次本地请求提交。
    */
   function configureCurrentCodex(): void {
-    void run("codex-configure", async () => {
-      const result = await api<{ message: string }>("/api/codex/configure", { method: "POST" });
-      setCodexConfigurationDialogOpen(false);
-      return result;
-    }, "Codex 已配置为使用本地 Gateway，请重启 Codex 后继续使用。");
+    void streamConfiguration({
+      software: softwareConfigurationSelected,
+      image: imageConfigurationSelected,
+      softwareBaseUrl,
+      imageBaseUrl,
+      softwareApiKey,
+      imageApiKey
+    });
+  }
+
+  /**
+   * 打开一键配置确认框并恢复默认的两项配置选择。
+   * @returns 无返回值。
+   * @remarks 每次新建配置操作都默认选择软件和生图配置，用户可在确认前取消任意一项。
+   */
+  function openCodexConfiguration(): void {
+    setSoftwareConfigurationSelected(true);
+    setImageConfigurationSelected(true);
+    setConfigurationStreamComplete(false);
+    setSoftwareBaseUrl("");
+    setImageBaseUrl("");
+    setSoftwareApiKey("");
+    setImageApiKey("");
+    setEditingSoftwareBaseUrl(false);
+    setEditingImageBaseUrl(false);
+    setEditingSoftwareApiKey(false);
+    setEditingImageApiKey(false);
+    setCodexConfigurationDialogOpen(true);
+  }
+
+  /**
+   * 接收软件与生图配置的 SSE 进度，并只追加服务端提供的安全日志文本。
+   * @param selection 用户确认要写入的配置步骤。
+   * @returns 流处理完成后的 Promise。
+   * @remarks 完成事件抵达后仍等待逐字动画结束，确保用户可读到完整结果。
+   */
+  async function streamConfiguration(selection: ConfigurationSelection): Promise<void> {
+    setBusy("codex-configure");
+    setConfigurationLogSource("");
+    setConfigurationTypedLength(0);
+    setConfigurationStreamComplete(false);
+    setConfigurationCompletionMessage(undefined);
+    try {
+      const response = await fetch("/api/codex/configure/stream", {
+        body: JSON.stringify(selection),
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        method: "POST"
+      });
+      if (!response.ok || !response.body) {
+        const data = await response.json().catch(() => ({})) as { error?: string };
+        throw new Error(data.error ?? `请求失败（${response.status}）`);
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const parsed = sseFrames(pending + decoder.decode(value, { stream: true }));
+        pending = parsed.pending;
+        for (const frame of parsed.frames) {
+          const event = frame.match(/^event:\s*(.+)$/m)?.[1]?.trim();
+          const payload = JSON.parse(frame.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n")) as { message?: string; error?: string };
+          if (event === "log" && payload.message) setConfigurationLogSource((current) => `${current}${current ? "\n" : ""}${payload.message}`);
+          if (event === "complete" && payload.message) {
+            setConfigurationLogSource((current) => `${current}${current ? "\n" : ""}${payload.message}`);
+            setConfigurationCompletionMessage(payload.message);
+          }
+          if (event === "error") throw new Error(payload.error ?? "一键配置失败。");
+        }
+      }
+      await refresh();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setConfigurationLogSource((current) => `${current}${current ? "\n" : ""}[失败] ${message}`);
+      notify("destructive", message);
+    } finally {
+      setConfigurationStreamComplete(true);
+    }
   }
 
   /**
@@ -443,7 +583,7 @@ function App() {
               <div className="rounded-xl border border-white/12 bg-white/8 p-4 backdrop-blur-sm">
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex min-w-0 items-center gap-2 text-xs text-indigo-100/70"><Activity className="size-3.5 shrink-0" />Codex 请求入口</div>
-                  <Tooltip><TooltipTrigger asChild><Button aria-label="一键配置当前机器的 Codex" className="shrink-0" disabled={!status?.codexConfiguration.available || Boolean(busy)} onClick={() => setCodexConfigurationDialogOpen(true)} size="sm" type="button" variant="secondary"><Settings2 />一键配置</Button></TooltipTrigger><TooltipContent>{status?.codexConfiguration.available ? "配置当前机器的 Codex" : "请先设置 GATEWAY_ACCESS_TOKEN"}</TooltipContent></Tooltip>
+                  <Tooltip><TooltipTrigger asChild><Button aria-label="一键配置当前机器" className="shrink-0" disabled={!status?.codexConfiguration.available || Boolean(busy)} onClick={openCodexConfiguration} size="sm" type="button" variant="secondary"><Settings2 />一键配置</Button></TooltipTrigger><TooltipContent>{status?.codexConfiguration.available ? "配置 Codex 与生图环境" : "请先设置 GATEWAY_ACCESS_TOKEN"}</TooltipContent></Tooltip>
                 </div>
                 <p className="mt-2 truncate font-mono text-sm font-medium">{status?.gateway.baseUrl ? `${status.gateway.baseUrl}/v1` : "等待 Gateway 连接"}</p>
                 <p className="mt-2 text-xs leading-5 text-indigo-100/70">模型名、请求体与 SSE 响应均原样透传。</p>
@@ -559,19 +699,22 @@ function App() {
     </Dialog>
 
     <Dialog onOpenChange={(open) => { if (open || busy !== "codex-configure") setCodexConfigurationDialogOpen(open); }} open={codexConfigurationDialogOpen}>
-      <DialogContent className="grid max-h-[calc(100vh-2rem)] gap-0 overflow-hidden p-0 sm:max-w-lg" showCloseButton={busy !== "codex-configure"}>
+      <DialogContent className="grid max-h-[calc(100vh-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-xl" showCloseButton={busy !== "codex-configure"}>
         <DialogHeader className="border-b border-border px-5 py-4 pr-12 sm:px-6">
-          <DialogTitle>配置当前机器的 Codex</DialogTitle>
-          <DialogDescription>将 Codex 的全局请求入口切换到本机 Gateway。</DialogDescription>
+          <DialogTitle>配置当前机器</DialogTitle>
+          <DialogDescription>{busy === "codex-configure" ? "正在执行本机配置，请保持此窗口打开。" : "将软件请求和生图环境统一切换到本机 Gateway。"}</DialogDescription>
         </DialogHeader>
-        <div className="min-h-0 overflow-y-auto px-5 py-5 text-sm leading-6 text-muted-foreground sm:px-6">
-          <p>当前模型名会保留并原样转发。已有自定义 provider 会保持名称；没有 provider 时才会创建 <code className="font-mono text-xs text-foreground">codex_gateway</code>。</p>
-          <p className="mt-3">现有 <code className="font-mono text-xs text-foreground">config.toml</code> 和 <code className="font-mono text-xs text-foreground">auth.json</code> 会先在本机创建备份。当前 provider 的旧认证会切换为本地 Gateway 令牌，原始内容可从备份恢复。</p>
-          <p className="mt-3 text-foreground">完成后请重启 Codex，使新配置生效。</p>
+        <div className="min-h-0 overflow-y-auto px-5 py-5 sm:px-6">
+          {busy === "codex-configure" || configurationStreamComplete ? <section aria-live="polite" className="rounded-xl border border-slate-700 bg-slate-950 p-4 font-mono text-xs leading-6 text-slate-300"><p className="mb-3 flex items-center gap-2 border-b border-slate-700 pb-2 text-cyan-300"><Activity className="size-3.5" />本机配置执行日志</p><p className="min-h-32 whitespace-pre-wrap break-words text-emerald-300">{configurationLogSource.slice(0, configurationTypedLength) || "正在建立本机配置通道..."}{configurationTypedLength < configurationLogSource.length && <span className="streaming-cursor" />}</p></section> : <div className="space-y-4 text-sm leading-6 text-muted-foreground">
+            {configurationPreviewError ? <p className="text-destructive">{configurationPreviewError}</p> : !configurationPreview ? <p className="flex items-center gap-2"><LoaderCircle className="size-4 animate-spin" />正在读取当前配置...</p> : <>
+              <section className={cn("rounded-xl border border-border bg-secondary/35 p-4", !softwareConfigurationSelected && "opacity-60")}><div className="flex items-center gap-3 font-medium text-foreground"><Checkbox checked={softwareConfigurationSelected} id="configure-software" onCheckedChange={(checked) => setSoftwareConfigurationSelected(checked === true)} /><label className="flex cursor-pointer items-center gap-2" htmlFor="configure-software"><Settings2 className="size-4 text-primary" />软件配置</label></div><dl className="mt-3 grid gap-1.5 text-xs"><div className="flex justify-between gap-4"><dt>当前 provider</dt><dd className="truncate font-mono text-foreground">{configurationPreview.software.provider}</dd></div><div className="flex justify-between gap-4"><dt>当前模型</dt><dd className="truncate font-mono text-foreground">{configurationPreview.software.model ?? "使用 Codex 默认值"}</dd></div><div className="flex justify-between gap-4"><dt>当前请求地址</dt><dd className="truncate font-mono text-foreground">{configurationPreview.software.currentBaseUrl ?? "未设置"}</dd></div><div className="flex items-center justify-between gap-4"><dt>待写入密钥</dt><dd className="flex min-w-0 items-center gap-1"><Input aria-label="软件配置写入密钥" autoComplete="new-password" className={cn("h-8 w-52 max-w-[60vw] font-mono text-xs", !editingSoftwareApiKey && "hidden")} maxLength={8192} onChange={(event) => setSoftwareApiKey(event.target.value)} placeholder="留空则使用网关密钥" type="password" value={softwareApiKey} /><span className={cn("truncate text-foreground", editingSoftwareApiKey && "hidden")}>{softwareApiKey ? "已填写，不显示值" : configurationPreview.image.gatewayApiKeyAvailable ? "使用网关密钥，不显示值" : "未准备"}</span><Tooltip><TooltipTrigger asChild><Button aria-label="编辑软件配置写入密钥" onClick={() => setEditingSoftwareApiKey((current) => !current)} size="icon-xs" type="button" variant="ghost"><Pencil /></Button></TooltipTrigger><TooltipContent>{editingSoftwareApiKey ? "收起密钥编辑" : "编辑写入密钥"}</TooltipContent></Tooltip></dd></div><div className="flex items-center justify-between gap-4"><dt>确认后地址</dt><dd className="flex min-w-0 items-center gap-1"><Input aria-label="软件配置写入地址" className={cn("h-8 w-52 max-w-[60vw] font-mono text-xs", !editingSoftwareBaseUrl && "hidden")} onChange={(event) => setSoftwareBaseUrl(event.target.value)} type="url" value={softwareBaseUrl} /><span className={cn("truncate font-mono text-foreground", editingSoftwareBaseUrl && "hidden")}>{softwareBaseUrl}</span><Tooltip><TooltipTrigger asChild><Button aria-label="编辑软件配置写入地址" onClick={() => setEditingSoftwareBaseUrl((current) => !current)} size="icon-xs" type="button" variant="ghost"><Pencil /></Button></TooltipTrigger><TooltipContent>{editingSoftwareBaseUrl ? "收起地址编辑" : "编辑写入地址"}</TooltipContent></Tooltip></dd></div></dl></section>
+              <section className={cn("rounded-xl border border-border bg-secondary/35 p-4", !imageConfigurationSelected && "opacity-60")}><div className="flex items-center gap-3 font-medium text-foreground"><Checkbox checked={imageConfigurationSelected} id="configure-image" onCheckedChange={(checked) => setImageConfigurationSelected(checked === true)} /><label className="flex cursor-pointer items-center gap-2" htmlFor="configure-image"><Activity className="size-4 text-[#24946b]" />生图配置</label></div><dl className="mt-3 grid gap-1.5 text-xs"><div className="flex justify-between gap-4"><dt>当前 OPENAI_BASE_URL</dt><dd className="truncate font-mono text-foreground">{configurationPreview.image.currentBaseUrl ?? "当前进程未检测到"}</dd></div><div className="flex justify-between gap-4"><dt>当前 OPENAI_API_KEY</dt><dd className="text-foreground">{configurationPreview.image.currentApiKeyConfigured ? "当前进程已检测到，不显示值" : "当前进程未检测到"}</dd></div><div className="flex items-center justify-between gap-4"><dt>待写入密钥</dt><dd className="flex min-w-0 items-center gap-1"><Input aria-label="生图配置写入密钥" autoComplete="new-password" className={cn("h-8 w-52 max-w-[60vw] font-mono text-xs", !editingImageApiKey && "hidden")} maxLength={8192} onChange={(event) => setImageApiKey(event.target.value)} placeholder="留空则使用网关密钥" type="password" value={imageApiKey} /><span className={cn("truncate text-foreground", editingImageApiKey && "hidden")}>{imageApiKey ? "已填写，不显示值" : configurationPreview.image.gatewayApiKeyAvailable ? "使用网关密钥，不显示值" : "未准备"}</span><Tooltip><TooltipTrigger asChild><Button aria-label="编辑生图配置写入密钥" onClick={() => setEditingImageApiKey((current) => !current)} size="icon-xs" type="button" variant="ghost"><Pencil /></Button></TooltipTrigger><TooltipContent>{editingImageApiKey ? "收起密钥编辑" : "编辑写入密钥"}</TooltipContent></Tooltip></dd></div><div className="flex items-center justify-between gap-4"><dt>确认后地址</dt><dd className="flex min-w-0 items-center gap-1"><Input aria-label="生图配置写入地址" className={cn("h-8 w-52 max-w-[60vw] font-mono text-xs", !editingImageBaseUrl && "hidden")} onChange={(event) => setImageBaseUrl(event.target.value)} type="url" value={imageBaseUrl} /><span className={cn("truncate font-mono text-foreground", editingImageBaseUrl && "hidden")}>{imageBaseUrl}</span><Tooltip><TooltipTrigger asChild><Button aria-label="编辑生图配置写入地址" onClick={() => setEditingImageBaseUrl((current) => !current)} size="icon-xs" type="button" variant="ghost"><Pencil /></Button></TooltipTrigger><TooltipContent>{editingImageBaseUrl ? "收起地址编辑" : "编辑写入地址"}</TooltipContent></Tooltip></dd></div><div className="flex justify-between gap-4"><dt>持久化位置</dt><dd className="text-right text-foreground">{configurationPreview.image.persistence}</dd></div></dl></section>
+              <p>软件配置会备份并更新 <code className="font-mono text-xs text-foreground">config.toml</code> 与 <code className="font-mono text-xs text-foreground">auth.json</code>，不会创建或改名 provider；生图配置会写入当前用户环境。取消勾选的项目不会被修改。</p>
+            </>}
+          </div>}
         </div>
         <DialogFooter className="border-t border-border bg-secondary/45 px-5 py-4 sm:px-6">
-          <Button disabled={busy === "codex-configure"} onClick={() => setCodexConfigurationDialogOpen(false)} type="button" variant="outline">取消</Button>
-          <Button disabled={busy === "codex-configure"} onClick={configureCurrentCodex} type="button">{busy === "codex-configure" ? <LoaderCircle className="animate-spin" /> : <Settings2 />}确认配置</Button>
+          {busy === "codex-configure" ? <span className="mr-auto flex items-center gap-2 text-xs text-muted-foreground"><LoaderCircle className="size-3.5 animate-spin" />正在写入本机配置</span> : <><Button onClick={() => setCodexConfigurationDialogOpen(false)} type="button" variant="outline">{configurationStreamComplete ? "关闭" : "取消"}</Button>{!configurationStreamComplete && <Button disabled={!configurationPreview || Boolean(configurationPreviewError) || (!softwareConfigurationSelected && !imageConfigurationSelected)} onClick={configureCurrentCodex} type="button"><Settings2 />确认配置</Button>}</>}
         </DialogFooter>
       </DialogContent>
     </Dialog>

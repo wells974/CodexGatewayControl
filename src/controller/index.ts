@@ -17,7 +17,10 @@ import {
   type Upstream
 } from "./database.js";
 import { proxyRequest } from "./proxy.js";
-import { configureCodex } from "./codex-config.js";
+import { configureCodex, resolveCodexHome } from "./codex-config.js";
+import { configureImageEnvironment } from "./image-environment.js";
+import { parse as parseToml } from "@iarna/toml";
+import { readFile } from "node:fs/promises";
 import { markCodexConfigurationCurrent } from "./gateway-port-state.js";
 import { ensurePrivateDirectory, ensurePrivateFile } from "./local-security.js";
 import path from "node:path";
@@ -25,6 +28,7 @@ import { fileURLToPath } from "node:url";
 
 type Probe = { healthy: boolean; latencyMs?: number; error?: string; checkedAt?: string };
 type GatewayTestResult = { endpoint: "/v1/responses"; stream: boolean; status: number; outputText: string | null; truncated: boolean };
+type ConfigurationSelection = { software: boolean; image: boolean; softwareBaseUrl: string; imageBaseUrl: string; softwareApiKey: string; imageApiKey: string };
 const probes = new Map<string, Probe>();
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const app = express();
@@ -138,6 +142,50 @@ function publicStatus() {
 }
 
 /**
+ * 读取一键配置对话框可安全展示的当前 Codex 配置摘要。
+ * @returns 不含认证材料的 provider、模型与目标地址摘要。
+ * @throws 配置文件无法读取或 TOML 格式损坏时抛出错误。
+ */
+async function codexConfigurationPreview(): Promise<{ software: { provider: string; model: string | null; currentBaseUrl: string | null; plannedBaseUrl: string }; image: { currentBaseUrl: string | null; currentApiKeyConfigured: boolean; gatewayApiKeyAvailable: boolean; plannedBaseUrl: string; persistence: string } }> {
+  const codexHome = resolveCodexHome();
+  const configPath = path.join(codexHome, "config.toml");
+  let provider = "openai（Codex 默认）";
+  let model: string | null = null;
+  let currentBaseUrl: string | null = null;
+  try {
+    const parsed = parseToml(await readFile(configPath, "utf8")) as Record<string, unknown>;
+    const currentProvider = typeof parsed.model_provider === "string" && parsed.model_provider.trim() ? parsed.model_provider.trim() : null;
+    if (currentProvider) provider = currentProvider;
+    if (typeof parsed.model === "string" && parsed.model.trim()) model = parsed.model.trim();
+    if (!currentProvider || currentProvider === "openai") {
+      currentBaseUrl = typeof parsed.openai_base_url === "string" && parsed.openai_base_url.trim() ? parsed.openai_base_url.trim() : null;
+    } else {
+      const providers = parsed.model_providers;
+      const providerConfig = providers && typeof providers === "object" && !Array.isArray(providers)
+        ? (providers as Record<string, unknown>)[currentProvider]
+        : null;
+      if (providerConfig && typeof providerConfig === "object" && !Array.isArray(providerConfig)) {
+        const baseUrl = (providerConfig as Record<string, unknown>).base_url;
+        currentBaseUrl = typeof baseUrl === "string" && baseUrl.trim() ? baseUrl.trim() : null;
+      }
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const targetBaseUrl = `http://127.0.0.1:${config.port}/v1`;
+  return {
+    software: { provider, model, currentBaseUrl, plannedBaseUrl: targetBaseUrl },
+    image: {
+      currentBaseUrl: process.env.OPENAI_BASE_URL?.trim() || null,
+      currentApiKeyConfigured: Boolean(process.env.OPENAI_API_KEY?.trim()),
+      gatewayApiKeyAvailable: Boolean(config.accessToken.trim()),
+      plannedBaseUrl: targetBaseUrl,
+      persistence: process.platform === "darwin" ? "macOS 用户图形会话" : process.platform === "win32" ? "Windows 当前用户环境" : "当前系统不支持自动持久化"
+    }
+  };
+}
+
+/**
  * 将本地配置失败原因转换为不包含路径、凭据或底层错误详情的管理页提示。
  * @param error 配置服务抛出的原始错误。
  * @returns 可安全返回给浏览器的中文错误。
@@ -151,7 +199,11 @@ function publicCodexConfigurationError(error: unknown): string {
     "当前 model_provider 未定义可更新的 provider，未执行配置。",
     "本地 Gateway 端口无效，未执行配置。",
     "本地 Gateway 地址无效，未执行配置。",
-    "Codex 配置目录无效，未执行配置。"
+    "配置地址无效，请填写 http:// 或 https:// 地址。",
+    "配置密钥无效，请填写非空密钥。",
+    "Codex 配置目录无效，未执行配置。",
+    "本地 Gateway 认证信息不完整，无法配置生图环境变量。",
+    "当前系统暂不支持自动配置生图环境变量。"
   ];
   return allowed.includes(message) ? message : "无法写入 Codex 配置，请确认当前用户拥有本地 Codex 配置目录的访问权限。";
 }
@@ -202,6 +254,124 @@ async function configureLocalCodex(_request: Request, response: Response): Promi
     }
   } catch (error) {
     response.status(400).json({ error: publicCodexConfigurationError(error) });
+  }
+}
+
+/**
+ * 向浏览器写入一条不含凭据的一键配置进度事件。
+ * @param response SSE 响应对象。
+ * @param message 要显示的中文进度文本。
+ * @returns 无返回值。
+ */
+function writeConfigurationEvent(response: Response, message: string): void {
+  response.write(`event: log\ndata: ${JSON.stringify({ message })}\n\n`);
+}
+
+/**
+ * 校验并规范化管理页提交的配置地址。
+ * @param value 候选的 API 基础地址。
+ * @param fallback 未提供值时使用的本机 Gateway API 基础地址。
+ * @returns 可安全写入配置的规范化 HTTP(S) 地址。
+ * @throws 地址格式错误、包含认证信息或携带查询片段时抛出中文错误。
+ * @remarks URL 中禁止用户名、密码、查询参数和片段，防止认证材料进入配置文件或日志。
+ */
+function configurationBaseUrl(value: unknown, fallback: string): string {
+  if (value === undefined) return fallback;
+  if (typeof value !== "string" || !value.trim()) throw new Error("配置地址无效，请填写 http:// 或 https:// 地址。");
+  try {
+    const url = new URL(value.trim());
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error("无效地址");
+    return url.href.replace(/\/$/, "");
+  } catch (_) {
+    throw new Error("配置地址无效，请填写 http:// 或 https:// 地址。");
+  }
+}
+
+/**
+ * 校验用户选择写入的 API Key，空值时回退到 Controller 内存中的网关密钥。
+ * @param value 候选 API Key；仅由本地管理页在用户主动输入后提交。
+ * @param fallback 不输入自定义密钥时使用的本地 Gateway 认证材料。
+ * @returns 可安全写入本地配置或环境变量的 API Key。
+ * @throws 输入不是字符串、只包含空白或超过允许长度时抛出中文错误。
+ * @remarks 返回值仅传给本地文件或本地系统环境，不写入 SSE、日志或管理接口响应。
+ */
+function configurationApiKey(value: unknown, fallback: string): string {
+  if (value === undefined || value === "") return fallback;
+  if (typeof value !== "string") throw new Error("配置密钥无效，请填写非空密钥。");
+  const key = value.trim();
+  if (!key || key.length > 8_192) throw new Error("配置密钥无效，请填写非空密钥。");
+  return key;
+}
+
+/**
+ * 校验管理页提交的配置步骤选择。
+ * @param value 请求体中的候选选择对象。
+ * @returns 合法且至少选中一项时的步骤选择，否则返回 null。
+ * @throws 用户填写的地址不符合安全格式时抛出中文错误。
+ * @remarks 仅接受布尔字段，避免错误请求意外写入用户的本地配置或环境变量。
+ */
+function selectedConfigurationSteps(value: unknown): ConfigurationSelection | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const selection = value as Record<string, unknown>;
+  if (typeof selection.software !== "boolean" || typeof selection.image !== "boolean") return null;
+  if (!selection.software && !selection.image) return null;
+  const fallback = `http://127.0.0.1:${config.port}/v1`;
+  return {
+    software: selection.software,
+    image: selection.image,
+    softwareBaseUrl: selection.software ? configurationBaseUrl(selection.softwareBaseUrl, fallback) : fallback,
+    imageBaseUrl: selection.image ? configurationBaseUrl(selection.imageBaseUrl, fallback) : fallback,
+    softwareApiKey: selection.software ? configurationApiKey(selection.softwareApiKey, config.accessToken) : config.accessToken,
+    imageApiKey: selection.image ? configurationApiKey(selection.imageApiKey, config.accessToken) : config.accessToken
+  };
+}
+
+/**
+ * 执行软件与生图配置，并以 SSE 分阶段返回可逐字展示的安全日志。
+ * @param request 已通过本地会话校验且包含步骤选择的管理请求。
+ * @param response SSE 响应对象。
+ * @returns 流结束后的 Promise。
+ * @remarks 不会发送 config.toml、auth.json、环境变量值或访问令牌。
+ */
+async function streamLocalConfiguration(request: Request, response: Response): Promise<void> {
+  let selection: ConfigurationSelection | null;
+  try {
+    selection = selectedConfigurationSteps(request.body);
+  } catch (error) {
+    response.status(400).json({ error: publicCodexConfigurationError(error) });
+    return;
+  }
+  if (!selection) {
+    response.status(400).json({ error: "请至少选择一项配置。" });
+    return;
+  }
+  response.status(200);
+  response.setHeader("content-type", "text/event-stream; charset=utf-8");
+  response.setHeader("cache-control", "no-cache, no-transform");
+  response.setHeader("connection", "keep-alive");
+  response.flushHeaders();
+  try {
+    if (selection.software) {
+      writeConfigurationEvent(response, "[软件配置] 正在校验本机 Codex 配置...");
+      await configureCodex({ accessToken: selection.softwareApiKey, gatewayHost: "127.0.0.1", gatewayPort: config.port, gatewayBaseUrl: selection.softwareBaseUrl });
+      markCodexConfigurationCurrent(config.dataDir, config.port);
+      writeConfigurationEvent(response, "[软件配置] config.toml 与 auth.json 已安全更新。");
+    }
+    if (selection.image) {
+      writeConfigurationEvent(response, "[生图配置] 正在写入 OPENAI_API_KEY...");
+      await configureImageEnvironment({ accessToken: selection.imageApiKey, baseUrl: selection.imageBaseUrl });
+      writeConfigurationEvent(response, "[生图配置] OPENAI_BASE_URL 已指向本机 Gateway。");
+    }
+    const message = selection.software && selection.image
+      ? "两类配置均已完成。请重启 Codex；新的终端或生图进程会读取环境变量。"
+      : selection.software
+        ? "软件配置已完成。请重启 Codex 使新的请求入口生效。"
+        : "生图配置已完成。请新开终端或生图进程以读取环境变量。";
+    response.write(`event: complete\ndata: ${JSON.stringify({ message })}\n\n`);
+  } catch (error) {
+    response.write(`event: error\ndata: ${JSON.stringify({ error: publicCodexConfigurationError(error) })}\n\n`);
+  } finally {
+    response.end();
   }
 }
 
@@ -404,7 +574,15 @@ app.get("/api/status", (request, response) => {
   issueSessionCookie(request, response);
   response.json(publicStatus());
 });
+app.get("/api/codex/configuration-preview", requireLocalToken, async (_request, response) => {
+  try {
+    response.json(await codexConfigurationPreview());
+  } catch {
+    response.status(400).json({ error: "无法读取当前 Codex 配置摘要。" });
+  }
+});
 app.post("/api/codex/configure", requireLocalToken, configureLocalCodex);
+app.post("/api/codex/configure/stream", requireLocalToken, streamLocalConfiguration);
 app.get("/api/upstreams", (_request, response) => response.json({ upstreams: publicStatus().upstreams }));
 app.get("/api/upstreams/:id/models", requireLocalToken, async (request, response) => {
   const id = routeId(request);
