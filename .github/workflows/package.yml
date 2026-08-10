@@ -6,6 +6,9 @@ on:
     tags:
       - "v*"
 
+env:
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+
 jobs:
   windows:
     name: Windows x64
