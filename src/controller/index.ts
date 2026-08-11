@@ -180,7 +180,7 @@ async function codexConfigurationPreview(): Promise<{ software: { provider: stri
       currentApiKeyConfigured: Boolean(process.env.OPENAI_API_KEY?.trim()),
       gatewayApiKeyAvailable: Boolean(config.accessToken.trim()),
       plannedBaseUrl: targetBaseUrl,
-      persistence: process.platform === "darwin" ? "macOS 用户图形会话" : process.platform === "win32" ? "Windows 当前用户环境" : "当前系统不支持自动持久化"
+      persistence: process.platform === "darwin" ? "macOS 图形会话、Zsh 与 Bash" : process.platform === "win32" ? "Windows 当前用户环境" : "当前系统不支持自动持久化"
     }
   };
 }
@@ -299,7 +299,7 @@ function configurationApiKey(value: unknown, fallback: string): string {
   if (value === undefined || value === "") return fallback;
   if (typeof value !== "string") throw new Error("配置密钥无效，请填写非空密钥。");
   const key = value.trim();
-  if (!key || key.length > 8_192) throw new Error("配置密钥无效，请填写非空密钥。");
+  if (!key || key.length > 8_192 || /\r|\n/.test(value)) throw new Error("配置密钥无效，请填写非空且不含换行的密钥。");
   return key;
 }
 

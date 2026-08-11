@@ -50,7 +50,7 @@ Node.js runtime 会从官方发布地址下载并校验 SHA-256。构建需要�
 
 安装版的本地数据目录固定为 `CodexGatewayControl`：Windows 使用 `%APPDATA%/CodexGatewayControl`，macOS 使用 `~/Library/CodexGatewayControl`。首次启动会在其中生成本地访问令牌、SQLite 数据库和 Gateway 管理页证书。
 
-也可以在管理页“Codex 请求入口”区域点击“一键配置”。确认框会展示当前软件配置和将写入的生图环境配置。软件配置会备份并更新 `config.toml`、`auth.json`：已有自定义 `model_provider` 时保留其名称并在原 provider 表中更新本机 Gateway 地址；没有 `model_provider` 时保持 Codex 内置 OpenAI provider，只更新顶层 `openai_base_url`，绝不新建或改名 `model_providers`。生图配置会为当前用户持久化 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`。Gateway 使用 `.env` 中的 `GATEWAY_ACCESS_TOKEN`，原 provider 的环境变量、直接令牌或命令认证会切换为该本地令牌，原始内容保存在自动备份中。它兼容 macOS 与 Windows，使用 `CODEX_HOME`，未设置时使用当前用户目录下的 `.codex`；操作前会在本机创建带时间戳的备份。配置会保留当前模型名，完成后需要重启 Codex，并新开终端或生图进程。
+也可以在管理页“Codex 请求入口”区域点击“一键配置”。确认框会展示当前软件配置和将写入的生图环境配置。软件配置会备份并更新 `config.toml`、`auth.json`：已有自定义 `model_provider` 时保留其名称并在原 provider 表中更新本机 Gateway 地址；没有 `model_provider` 时保持 Codex 内置 OpenAI provider，只更新顶层 `openai_base_url`，绝不新建或改名 `model_providers`。生图配置会为当前用户持久化 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`：macOS 除了写入图形会话，还会在 `~/.zprofile`、`~/.zshrc`、`~/.bash_profile` 与 `~/.bashrc` 中维护带标记的环境变量区块，覆盖 Zsh 和 Bash 的常见启动场景；这些文件会改为仅当前用户可读。Windows 使用 `setx` 写入当前用户环境，新开的进程才会读取新值；若管理员配置了同名系统变量，应移除或修改该系统变量，避免其覆盖当前用户配置。Gateway 使用 `.env` 中的 `GATEWAY_ACCESS_TOKEN`，原 provider 的环境变量、直接令牌或命令认证会切换为该本地令牌，原始内容保存在自动备份中。它兼容 macOS 与 Windows，使用 `CODEX_HOME`，未设置时使用当前用户目录下的 `.codex`；操作前会在本机创建带时间戳的备份。配置会保留当前模型名，完成后需要重启 Codex，并新开终端或生图进程。
 
 ## API
 
