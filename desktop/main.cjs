@@ -439,6 +439,16 @@ function createTray() {
 }
 
 /**
+ * 隐藏 macOS Dock 中的应用图标。
+ * @returns {void} 非 macOS 或 Dock API 不可用时直接返回；否则提交隐藏请求。
+ * @remarks 应用只提供菜单栏托盘入口，隐藏 Dock 图标不会影响托盘菜单或本地管理页。
+ */
+function hideDockIcon() {
+  if (process.platform !== "darwin" || !app.dock) return;
+  app.dock.hide();
+}
+
+/**
  * 创建不可见的保活窗口，确保无 BrowserWindow 的菜单栏应用不会被 macOS 自动结束。
  * @returns {void} 保活窗口创建完成后返回。
  * @remarks 窗口不加载页面、不出现在 Dock 或任务栏，用户仅通过菜单栏托盘与应用交互。
@@ -501,6 +511,7 @@ if (!singleInstance) {
     });
   });
   app.whenReady().then(() => {
+    hideDockIcon();
     createKeepAliveWindow();
     createTray();
     return startApplication();

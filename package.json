@@ -60,6 +60,9 @@
     },
     "mac": {
       "icon": "desktop/assets/cgc-app-icon.icns",
+      "extendInfo": {
+        "LSUIElement": true
+      },
       "target": [{ "target": "dmg", "arch": ["x64", "arm64"] }],
       "artifactName": "CodexGatewayControl-${version}-mac-${arch}.${ext}"
     },
