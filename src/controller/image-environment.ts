@@ -10,6 +10,7 @@ const shellBlockStart = "# >>> Codex Gateway Control OpenAI environment >>>";
 const shellBlockEnd = "# <<< Codex Gateway Control OpenAI environment <<<";
 const shellBlockStartPattern = /^# >>> Codex Gateway Control OpenAI[^\r\n]*>>>[ \t]*(?:\r?\n|$)/gm;
 const shellBlockEndPattern = /^# <<< Codex Gateway Control OpenAI[^\r\n]*<<<[ \t]*(?:\r?\n|$)/gm;
+const localProxyBypassHosts = "127.0.0.1,localhost,::1";
 
 export type ImageEnvironmentOptions = {
   accessToken: string;
@@ -23,6 +24,66 @@ export type ImageEnvironmentResult = {
   configured: true;
   message: string;
 };
+
+/**
+ * 将本机地址加入 Windows 当前用户的代理绕过列表。
+ * @param executeCommand 可执行系统命令的函数，测试时可注入替身。
+ * @param environment 当前进程环境，用于合并已有的大小写变量值。
+ * @returns 环境变量写入完成后的 Promise。
+ * @throws setx 执行失败时抛出底层错误。
+ * @remarks 只增加本机地址，不关闭或覆盖用户已有的代理配置；新启动的 Codex 进程才会读取变更。
+ */
+export async function configureWindowsProxyBypass(
+  executeCommand: (file: string, arguments_: string[]) => Promise<unknown> = executeFile,
+  environment: NodeJS.ProcessEnv = process.env
+): Promise<void> {
+  const current = [environment.NO_PROXY, environment.no_proxy]
+    .filter((value): value is string => Boolean(value?.trim()))
+    .flatMap((value) => value.split(/[;,]/).map((entry) => entry.trim()))
+    .filter(Boolean);
+  const entries = [...new Set([...current, ...localProxyBypassHosts.split(",")])];
+  const value = entries.join(",");
+  await executeCommand("setx", ["NO_PROXY", value]);
+  await executeCommand("setx", ["no_proxy", value]);
+  environment.NO_PROXY = value;
+  environment.no_proxy = value;
+}
+
+/**
+ * 将本机地址加入 macOS 图形会话和常用 Shell 的代理绕过列表。
+ * @param homeDirectory 当前用户主目录，用于定位 Shell 启动文件。
+ * @param executeCommand 可执行 launchctl 的函数，测试时可注入替身。
+ * @returns 代理绕过配置完成后的 Promise。
+ * @throws 启动文件读写或 launchctl 执行失败时抛出底层错误。
+ * @remarks 保留已有 NO_PROXY/no_proxy 地址；新启动的 Codex 进程才会读取 Shell 配置变更。
+ */
+export async function configureMacProxyBypass(
+  homeDirectory: string = homedir(),
+  executeCommand: (file: string, arguments_: string[]) => Promise<unknown> = executeFile
+): Promise<void> {
+  for (const filePath of macShellProfilePaths(homeDirectory)) {
+    const current = await readOptionalText(filePath);
+    const lineEnding = current?.includes("\r\n") ? "\r\n" : "\n";
+    const lines = (current ?? "").split(/\r?\n/);
+    const found = new Set<string>();
+    const updated = lines.flatMap((line) => {
+      const match = line.match(/^\s*(?:export\s+)?(NO_PROXY|no_proxy)\s*=/);
+      if (!match) return [line];
+      const name = match[1];
+      if (found.has(name)) return [];
+      found.add(name);
+      const currentValue = line.slice(line.indexOf("=") + 1).trim().replace(/^['\"]|['\"]$/g, "");
+      const entries = [...new Set([...currentValue.split(/[;,]/).map((entry) => entry.trim()).filter(Boolean), ...localProxyBypassHosts.split(",")])];
+      return [`export ${name}=${shellSingleQuote(entries.join(","))}`];
+    });
+    for (const name of ["NO_PROXY", "no_proxy"]) {
+      if (!found.has(name)) updated.push(`export ${name}=${shellSingleQuote(localProxyBypassHosts)}`);
+    }
+    await atomicWriteShellProfile(filePath, `${updated.join(lineEnding).replace(/(?:\r?\n)*$/, "")}${lineEnding}`);
+  }
+  await executeCommand("launchctl", ["setenv", "NO_PROXY", localProxyBypassHosts]);
+  await executeCommand("launchctl", ["setenv", "no_proxy", localProxyBypassHosts]);
+}
 
 /**
  * 返回 macOS 上需要维护的 Zsh 与 Bash 启动文件路径。
@@ -171,7 +232,7 @@ function validatedEnvironmentValues(token: string, baseUrl: string): { token: st
  * @param options 本地 Gateway 令牌、基础地址及可测试的平台与用户目录覆盖项。
  * @returns 环境变量配置成功后的非敏感结果。
  * @throws 当前平台不受支持、令牌为空、Shell 配置保护校验失败或系统环境变量工具执行失败时抛出中文错误。
- * @remarks macOS 同步更新 launchctl、Zsh 与 Bash 启动文件；Windows 使用 setx 写入用户环境；令牌不会写入日志或返回给浏览器。
+ * @remarks macOS 同步更新 launchctl、Zsh 与 Bash 启动文件；Windows 使用 setx 写入用户环境并维护本机代理绕过地址；令牌不会写入日志或返回给浏览器。
  */
 export async function configureImageEnvironment(options: ImageEnvironmentOptions): Promise<ImageEnvironmentResult> {
   const { token, baseUrl } = validatedEnvironmentValues(options.accessToken, options.baseUrl);

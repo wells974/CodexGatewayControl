@@ -15,7 +15,7 @@ import {
 } from "./database.js";
 import { proxyRequest } from "./proxy.js";
 import { configureCodex, resolveCodexHome } from "./codex-config.js";
-import { configureImageEnvironment } from "./image-environment.js";
+import { configureImageEnvironment, configureMacProxyBypass, configureWindowsProxyBypass } from "./image-environment.js";
 import { parse as parseToml } from "@iarna/toml";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -305,6 +305,13 @@ async function streamLocalConfiguration(request: Request, response: Response): P
       writeConfigurationEvent(response, "[生图配置] 正在写入 OPENAI_API_KEY...");
       await configureImageEnvironment({ accessToken: selection.imageApiKey, baseUrl: selection.imageBaseUrl });
       writeConfigurationEvent(response, "[生图配置] OPENAI_BASE_URL 已指向本机 Gateway。");
+    }
+    if (process.platform === "win32") {
+      await configureWindowsProxyBypass();
+      writeConfigurationEvent(response, "[本机网络] Windows 本机地址已加入代理绕过列表。");
+    } else if (process.platform === "darwin") {
+      await configureMacProxyBypass();
+      writeConfigurationEvent(response, "[本机网络] macOS 本机地址已加入代理绕过列表。");
     }
     const message = selection.software && selection.image
       ? "两类配置均已完成。请重启 Codex；新的终端或生图进程会读取环境变量。"

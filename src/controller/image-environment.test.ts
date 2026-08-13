@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { configureImageEnvironment, macShellProfilePaths, mergeMacShellEnvironment } from "./image-environment.js";
+import { configureImageEnvironment, configureMacProxyBypass, configureWindowsProxyBypass, macShellProfilePaths, mergeMacShellEnvironment } from "./image-environment.js";
 
 test("不支持的平台不会写入生图环境变量", async () => {
   await assert.rejects(
@@ -112,4 +112,33 @@ test("含换行的密钥会在写入前被拒绝", async () => {
     configureImageEnvironment({ accessToken: "token\nexport PATH=/bad", baseUrl: "http://127.0.0.1:4000/v1", platform: "linux" }),
     /不能包含换行符/
   );
+});
+
+test("Windows 代理绕过配置会保留已有地址并补充本机地址", async () => {
+  const commands: Array<{ file: string; arguments_: string[] }> = [];
+  const environment: NodeJS.ProcessEnv = { NO_PROXY: "example.com;127.0.0.1", no_proxy: "internal.example" };
+  await configureWindowsProxyBypass(async (file, arguments_) => { commands.push({ file, arguments_ }); }, environment);
+  assert.deepEqual(commands, [
+    { file: "setx", arguments_: ["NO_PROXY", "example.com,127.0.0.1,internal.example,localhost,::1"] },
+    { file: "setx", arguments_: ["no_proxy", "example.com,127.0.0.1,internal.example,localhost,::1"] }
+  ]);
+  assert.equal(environment.NO_PROXY, "example.com,127.0.0.1,internal.example,localhost,::1");
+  assert.equal(environment.no_proxy, "example.com,127.0.0.1,internal.example,localhost,::1");
+});
+
+test("macOS 代理绕过配置会保留 Shell 中已有地址并同步图形会话", async () => {
+  const homeDirectory = await mkdtemp(path.join(tmpdir(), "cgc-proxy-bypass-"));
+  const commands: Array<{ file: string; arguments_: string[] }> = [];
+  try {
+    await writeFile(path.join(homeDirectory, ".zshrc"), "export NO_PROXY='example.com'\n", "utf8");
+    await configureMacProxyBypass(homeDirectory, async (file, arguments_) => { commands.push({ file, arguments_ }); });
+    assert.match(await readFile(path.join(homeDirectory, ".zshrc"), "utf8"), /export NO_PROXY='example.com,127\.0\.0\.1,localhost,::1'/);
+    assert.match(await readFile(path.join(homeDirectory, ".bashrc"), "utf8"), /export no_proxy='127\.0\.0\.1,localhost,::1'/);
+    assert.deepEqual(commands, [
+      { file: "launchctl", arguments_: ["setenv", "NO_PROXY", "127.0.0.1,localhost,::1"] },
+      { file: "launchctl", arguments_: ["setenv", "no_proxy", "127.0.0.1,localhost,::1"] }
+    ]);
+  } finally {
+    await rm(homeDirectory, { recursive: true, force: true });
+  }
 });
