@@ -1,8 +1,5 @@
 import crypto from "node:crypto";
 import express, { type NextFunction, type Request, type Response } from "express";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import https from "node:https";
-import selfsigned from "selfsigned";
 import { config, sessionCookieValue } from "./config.js";
 import {
   activeUpstream,
@@ -21,8 +18,8 @@ import { configureCodex, resolveCodexHome } from "./codex-config.js";
 import { configureImageEnvironment } from "./image-environment.js";
 import { parse as parseToml } from "@iarna/toml";
 import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { markCodexConfigurationCurrent } from "./gateway-port-state.js";
-import { ensurePrivateDirectory, ensurePrivateFile } from "./local-security.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -33,65 +30,33 @@ const probes = new Map<string, Probe>();
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const app = express();
 app.disable("x-powered-by");
-const codexEmbedOrigin = "app://-";
-const tlsKeyPath = path.join(config.dataDir, "gateway-ui-key.pem");
-const tlsCertificatePath = path.join(config.dataDir, "gateway-ui-cert.pem");
-let automaticCodexConfigurationError: string | null = null;
 
 /**
- * 判断请求来源是否是本机管理页或受支持的 Codex blob 嵌入页。
+ * 判断请求来源是否是本机管理页。
  * @param origin 浏览器发送的 Origin 请求头。
  * @returns 来源允许访问本机 Controller 时返回 true。
  * @remarks 不接受任意 Origin，避免将本地管理接口暴露给其他网页。
  */
 function isAllowedControllerOrigin(origin: string | undefined): boolean {
-  return !origin || /^https?:\/\/127\.0\.0\.1(?::\d+)?$/.test(origin) || origin === codexEmbedOrigin;
-}
-
-/**
- * 为 Codex blob 嵌入页添加受限的凭据 CORS 响应头。
- * @param request Express 请求对象。
- * @param response Express 响应对象。
- * @param next 继续处理下一个中间件的回调。
- * @returns 无返回值。
- * @remarks 仅允许固定 `app://-` origin，Cookie 本身仍为 HttpOnly，绝不返回给页面脚本。
- */
-function allowCodexEmbedCors(request: Request, response: Response, next: NextFunction): void {
-  if (request.header("origin") !== codexEmbedOrigin) {
-    next();
-    return;
-  }
-  response.setHeader("access-control-allow-origin", codexEmbedOrigin);
-  response.setHeader("access-control-allow-credentials", "true");
-  response.setHeader("access-control-allow-methods", "GET, POST, PATCH, DELETE, OPTIONS");
-  response.setHeader("access-control-allow-headers", "content-type");
-  response.setHeader("vary", "Origin");
-  if (request.method === "OPTIONS") {
-    response.sendStatus(204);
-    return;
-  }
-  next();
+  return !origin || /^https?:\/\/127\.0\.0\.1(?::\d+)?$/.test(origin);
 }
 
 /**
  * 写入仅由浏览器自动携带的本地管理会话 Cookie。
- * @param request Express 请求对象，用于识别普通浏览器或 Codex blob 嵌入页。
+ * @param _request Express 请求对象，保留以与 Express 中间件签名一致。
  * @param response Express 响应对象。
  * @returns 无返回值。
- * @remarks HTTPS 嵌入页使用 CHIPS `Partitioned; SameSite=None; Secure` Cookie，将会话绑定到 `app://-` 顶级站点；Cookie 值不会进入 HTML、CDP 或日志。
+ * @remarks Cookie 仅由本机浏览器自动携带；其值不会进入 HTML、日志或其他客户端代码。
  */
-function issueSessionCookie(request: Request, response: Response): void {
-  const embedded = request.header("origin") === codexEmbedOrigin;
+function issueSessionCookie(_request: Request, response: Response): void {
   response.cookie("gateway_session", sessionCookieValue(), {
     httpOnly: true,
-    sameSite: embedded ? "none" : "strict",
-    secure: embedded,
-    partitioned: embedded,
+    sameSite: "strict",
+    secure: false,
     path: "/"
   });
 }
 
-app.use(allowCodexEmbedCors);
 app.use("/api", express.json({ limit: "32kb" }));
 
 function cookies(request: Request): Record<string, string> {
@@ -134,7 +99,7 @@ function publicStatus() {
   const active = activeUpstream();
   return {
     gateway: { healthy: true, baseUrl: `http://${config.host}:${config.port}`, proxyPath: "/v1/*" },
-    codexConfiguration: { available: Boolean(config.accessToken.trim()), automaticMigrationError: automaticCodexConfigurationError },
+    codexConfiguration: { available: Boolean(config.accessToken.trim()), automaticMigrationError: null },
     activeUpstream: active ? { id: active.id, name: active.name, apiBase: active.apiBase } : null,
     upstreams: listUpstreams().map((upstream) => ({ ...upstream, ...probes.get(upstream.id) })),
     notice: "网关会将每个 Codex 请求原样转发到当前中转，不改写模型名或流式响应。切换只影响后续请求。"
@@ -206,27 +171,6 @@ function publicCodexConfigurationError(error: unknown): string {
     "当前系统暂不支持自动配置生图环境变量。"
   ];
   return allowed.includes(message) ? message : "无法写入 Codex 配置，请确认当前用户拥有本地 Codex 配置目录的访问权限。";
-}
-
-/**
- * 在用户确认端口迁移后，将 Codex 配置安全同步到新的本机 Gateway 地址。
- * @returns 自动配置成功或失败后完成，不向上抛出配置错误。
- * @remarks 仅接受桌面主进程在用户确认后设置的环境标记；失败时保留迁移状态并启动管理页，避免在旧地址下启动 Codex。
- */
-async function configureCodexAfterConfirmedPortMigration(): Promise<void> {
-  if (process.env.GATEWAY_AUTO_CONFIGURE_CODEX !== "true") return;
-  try {
-    await configureCodex({
-      accessToken: config.accessToken,
-      gatewayHost: "127.0.0.1",
-      gatewayPort: config.port
-    });
-    markCodexConfigurationCurrent(config.dataDir, config.port);
-    console.log("已自动更新 Codex 的本机 Gateway 设置。");
-  } catch (error) {
-    automaticCodexConfigurationError = publicCodexConfigurationError(error);
-    console.error("无法自动更新 Codex 的本机 Gateway 设置，已保留管理页供手动完成配置。");
-  }
 }
 
 /**
@@ -675,7 +619,26 @@ app.post("/api/upstreams/:id/test-request", requireLocalToken, async (request, r
 
 app.all("/v1/{*path}", proxyRequest);
 
-const webRoot = path.resolve(process.env.GATEWAY_WEB_DIR ?? path.join(root, "dist-web"));
+/**
+ * 解析管理页静态资源目录。
+ * @returns 包含 `index.html` 的管理页目录绝对路径。
+ * @throws 所有候选目录都缺少管理页入口时抛出错误。
+ * @remarks 优先使用桌面启动器传入的目录；兼容开发构建、runtime 打包和直接启动场景，避免回退到不存在的 `Contents/dist-web`。
+ */
+function resolveWebRoot(): string {
+  const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    process.env.GATEWAY_WEB_DIR,
+    path.join(moduleDirectory, "dist-web"),
+    path.resolve(moduleDirectory, "../../dist-web"),
+    path.resolve(process.cwd(), "dist-web")
+  ].filter((candidate): candidate is string => Boolean(candidate?.trim())).map((candidate) => path.resolve(candidate));
+  const selected = candidates.find((candidate) => existsSync(path.join(candidate, "index.html")));
+  if (!selected) throw new Error("管理页静态资源缺失，无法启动 Gateway。");
+  return selected;
+}
+
+const webRoot = resolveWebRoot();
 app.use((request, response, next) => {
   if (request.method === "GET" && !request.path.startsWith("/api") && request.path !== "/health" && !request.path.startsWith("/v1/")) {
     issueSessionCookie(request, response);
@@ -683,62 +646,28 @@ app.use((request, response, next) => {
   next();
 });
 app.use(express.static(webRoot));
-app.get("/{*path}", (_request, response) => response.sendFile(path.join(webRoot, "index.html")));
-
-/**
- * 创建或读取仅供本机 Gateway 管理页使用的 TLS 证书。
- * @returns HTTPS 服务所需的私钥和证书文本。
- * @throws 证书生成失败或生成后的文件无法读取时抛出错误。
- * @remarks 使用 Node 库生成证书，不依赖 macOS/Windows 的 openssl 安装；证书和私钥仅存于本地 `.data`。
- */
-async function gatewayTlsCredentials(): Promise<{ key: Buffer; cert: Buffer }> {
-  ensurePrivateDirectory(config.dataDir);
-  if (!existsSync(tlsKeyPath) || !existsSync(tlsCertificatePath)) {
-    const generated = await selfsigned.generate(
-        [{ name: "commonName", value: "127.0.0.1" }],
-      {
-        keySize: 2048,
-        notAfterDate: new Date(Date.now() + 3650 * 24 * 60 * 60 * 1000),
-        algorithm: "sha256",
-        extensions: [
-          { name: "basicConstraints", cA: false },
-          { name: "keyUsage", digitalSignature: true, keyEncipherment: true },
-          { name: "extKeyUsage", serverAuth: true },
-          { name: "subjectAltName", altNames: [{ type: 7, ip: "127.0.0.1" }, { type: 2, value: "localhost" }] }
-        ]
-      }
-    );
-    writeFileSync(tlsKeyPath, generated.private, { mode: 0o600 });
-    writeFileSync(tlsCertificatePath, generated.cert, { mode: 0o600 });
-  }
-  ensurePrivateFile(tlsKeyPath);
-  ensurePrivateFile(tlsCertificatePath);
-  return { key: readFileSync(tlsKeyPath), cert: readFileSync(tlsCertificatePath) };
-}
-
-await configureCodexAfterConfirmedPortMigration();
-const tlsCredentials = await gatewayTlsCredentials();
-const httpServer = app.listen(config.port, config.host, () => console.log(`Codex Gateway 代理已监听 http://${config.host}:${config.port}`));
-const httpsServer = https.createServer(tlsCredentials, app).listen(config.uiTlsPort, config.host, () => {
-  console.log(`Codex Gateway 管理页已监听 https://${config.host}:${config.uiTlsPort}`);
+app.get("/{*path}", (_request, response) => {
+  response.sendFile(path.join(webRoot, "index.html"), (error) => {
+    if (error && !response.headersSent) response.status(503).send("管理页资源暂不可用，请重启 Codex Gateway Control。\n");
+  });
 });
 
+const httpServer = app.listen(config.port, config.host, () => console.log(`Codex Gateway 代理已监听 http://${config.host}:${config.port}`));
+
 /**
- * 在任一本地监听端口不可用时关闭另一服务并退出，避免留下半可用 Controller。
+ * 在本地监听端口不可用时退出，避免留下半可用 Controller。
  * @param protocol 发生错误的监听协议名称。
  * @returns 无返回值。
  * @remarks 不输出底层路径、请求令牌或其他私密配置；启动器可据此报告明确的本地端口冲突。
  */
-function failOnListenError(protocol: "HTTP" | "HTTPS"): (error: NodeJS.ErrnoException) => void {
+function failOnListenError(protocol: "HTTP"): (error: NodeJS.ErrnoException) => void {
   return (error) => {
-    const port = protocol === "HTTP" ? config.port : config.uiTlsPort;
+    const port = config.port;
     const reason = error.code === "EADDRINUSE" ? "端口已被其他本地程序占用" : "无法绑定本地端口";
     console.error(`Codex Gateway ${protocol} 启动失败：127.0.0.1:${port} ${reason}。`);
     httpServer.close();
-    httpsServer.close();
     process.exitCode = 1;
   };
 }
 
 httpServer.once("error", failOnListenError("HTTP"));
-httpsServer.once("error", failOnListenError("HTTPS"));

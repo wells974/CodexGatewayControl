@@ -221,16 +221,6 @@ function App() {
   const [testDialogElement, setTestDialogElement] = useState<HTMLDivElement | null>(null);
 
   /**
-   * 在嵌入式 Gateway 完成首次 React 渲染后通知 Codex 注入层。
-   * @returns 清理函数；当前无需额外清理时返回 undefined。
-   * @remarks 消息不包含会话令牌、上游凭据或 Controller 私密数据；父页面会校验 iframe 窗口与 loopback origin。
-   */
-  useEffect(() => {
-    if (window.parent === window) return;
-    window.parent.postMessage({ type: "codex-gateway:ready" }, "*");
-  }, []);
-
-  /**
    * 显示统一的短暂操作反馈。
    * @param variant 反馈的成功或错误状态。
    * @param description 显示给用户的具体内容。
@@ -776,7 +766,7 @@ function App() {
         </DialogHeader>
         <div className="space-y-4 text-sm leading-6 text-muted-foreground">
           <div className="border-l-2 border-primary pl-3 text-foreground">{status?.notice ?? "正在读取网关状态..."}</div>
-          <div className="flex gap-3"><KeyRound className="mt-1 size-4 shrink-0 text-primary" /><p><strong className="font-medium text-foreground">凭据只留在本机</strong><br />上游 API Key 仅保存在本机 SQLite，管理页、iframe 和 CDP 注入脚本均不会接收该信息。</p></div>
+          <div className="flex gap-3"><KeyRound className="mt-1 size-4 shrink-0 text-primary" /><p><strong className="font-medium text-foreground">凭据只留在本机</strong><br />上游 API Key 仅保存在本机 SQLite，管理页不会接收该信息。</p></div>
           <div className="flex gap-3"><RefreshCw className="mt-1 size-4 shrink-0 text-primary" /><p><strong className="font-medium text-foreground">切换只影响后续请求</strong><br />已开始的流会继续由原中转完成，不会被迁移到新的中转。</p></div>
           <div className="flex gap-3"><Server className="mt-1 size-4 shrink-0 text-primary" /><p><strong className="font-medium text-foreground">请求保持原样</strong><br />Gateway 不改写模型名、请求路径、请求体或 SSE 响应。</p></div>
         </div>

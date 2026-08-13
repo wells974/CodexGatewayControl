@@ -1,6 +1,6 @@
 {
   "name": "codex-gateway-control",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "main": "desktop/main.cjs",
@@ -21,10 +21,6 @@
     "package:mac:intel": "npm run build:runtime && node scripts/fetch-node-runtime.mjs --target mac-x64 && electron-builder --mac dmg --x64 --publish never",
     "package:mac:arm64": "npm run build:runtime && node scripts/fetch-node-runtime.mjs --target mac-arm64 && electron-builder --mac dmg --arm64 --publish never",
     "package:all": "npm run package:win && npm run package:mac:intel && npm run package:mac:arm64",
-    "inject": "npm run codex",
-    "codex": "npm run build && node scripts/codex-gateway.mjs --launch --watch --open",
-    "gateway:codex": "npm run codex",
-    "codex:attach": "npm run build && node scripts/codex-gateway.mjs --attach-existing --watch --open",
     "gateway": "npm start",
     "test": "tsx --test src/controller/*.test.ts"
   },
@@ -38,7 +34,6 @@
     "express": "^5.1.0",
     "lucide-react": "^1.28.0",
     "radix-ui": "^1.6.7",
-    "selfsigned": "^5.5.0",
     "tailwind-merge": "^3.6.0",
     "tailwindcss": "^4.3.3",
     "ws": "^8.18.1"

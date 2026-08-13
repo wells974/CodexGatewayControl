@@ -43,20 +43,12 @@ async function bundleRuntime(entryPoint, outputFile) {
  */
 async function main() {
   await rm(runtimeRoot, { recursive: true, force: true });
-  await mkdir(path.join(runtimeRoot, "inject"), { recursive: true });
+  await mkdir(runtimeRoot, { recursive: true });
   await bundleRuntime(
     path.join(projectRoot, "src/controller/index.ts"),
     path.join(runtimeRoot, "controller.mjs")
   );
-  await bundleRuntime(
-    path.join(projectRoot, "scripts/codex-gateway.mjs"),
-    path.join(runtimeRoot, "launcher.mjs")
-  );
   await cp(path.join(projectRoot, "dist-web"), path.join(runtimeRoot, "dist-web"), { recursive: true });
-  await cp(
-    path.join(projectRoot, "inject/codex-gateway.user.js"),
-    path.join(runtimeRoot, "inject/codex-gateway.user.js")
-  );
   console.log(`Gateway runtime 已生成：${runtimeRoot}`);
 }
 

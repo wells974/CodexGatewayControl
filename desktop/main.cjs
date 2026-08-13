@@ -1,5 +1,5 @@
 const { app, BrowserWindow, Menu, nativeImage, shell, Tray, dialog } = require("electron");
-const { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } = require("node:fs");
+const { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } = require("node:fs");
 const { spawn, spawnSync } = require("node:child_process");
 const os = require("node:os");
 const path = require("node:path");
@@ -9,15 +9,12 @@ const applicationName = "CodexGatewayControl";
 app.setPath("userData", userDataRoot());
 const singleInstance = app.requestSingleInstanceLock();
 const preferredControllerPort = Number(process.env.GATEWAY_PORT ?? process.env.CONTROLLER_PORT ?? 4000);
-const preferredUiTlsPort = Number(process.env.GATEWAY_UI_TLS_PORT ?? 4401);
 const controllerPortIsExplicit = Boolean(process.env.GATEWAY_PORT || process.env.CONTROLLER_PORT);
 let tray = null;
 let keepAliveWindow = null;
 let controller = null;
-let launcher = null;
 let stopping = false;
 let controllerOrigin = null;
-let gatewayUiOrigin = null;
 
 /**
  * 返回不包含人为添加空格目录名的安装版用户数据根目录。
@@ -44,7 +41,7 @@ function runtimeRoot() {
 
 /**
  * 返回当前平台内置 Node.js 可执行文件路径。
- * @returns {string} 可启动 Controller 和 launcher 的 Node.js 路径。
+ * @returns {string} 可启动 Controller 的 Node.js 路径。
  * @remarks 开发模式允许使用环境变量或 PATH 中的 node；安装模式必须使用 resources/node-runtime。
  */
 function nodeExecutable() {
@@ -146,9 +143,9 @@ async function findLoopbackPort(preferredPort, reservedPorts = [], fallbackPort 
 /**
  * 选择本轮必须使用的稳定 Gateway HTTP 代理端口。
  * @param {string} dataDirectory Gateway 私密数据目录。
- * @returns {Promise<{controllerPort: number, codexConfigurationRequired: boolean, initialized: boolean, autoConfigureCodex: boolean}|null>} 已确认端口及自动修复标记；用户取消时返回 null。
+ * @returns {Promise<{controllerPort: number, initialized: boolean}|null>} 已确认端口；用户取消时返回 null。
  * @throws 显式端口或已保存端口被占用时抛出错误。
- * @remarks 已配置过 Codex 的端口绝不静默递增；仅首次无状态且用户确认自动修复后才会选择新端口。
+ * @remarks 端口仅供 Gateway 自身使用；不会因为端口变化自动启动或修改 Codex。
  */
 async function selectStableControllerPort(dataDirectory) {
   if (controllerPortIsExplicit && !isGatewayPort(preferredControllerPort)) {
@@ -160,12 +157,9 @@ async function selectStableControllerPort(dataDirectory) {
     ? preferredControllerPort
     : saved?.controllerPort ?? (isGatewayPort(preferredControllerPort) ? preferredControllerPort : 4000);
   if (await canBindLoopbackPort(controllerPort)) {
-    const configurationChanged = controllerPortIsExplicit && Boolean(previousState && previousState.controllerPort !== controllerPort);
     return {
       controllerPort,
-      codexConfigurationRequired: configurationChanged || saved?.codexConfigurationRequired === true,
-      initialized: !previousState && !controllerPortIsExplicit,
-      autoConfigureCodex: false
+      initialized: !previousState && !controllerPortIsExplicit
     };
   }
   if (controllerPortIsExplicit) {
@@ -173,17 +167,17 @@ async function selectStableControllerPort(dataDirectory) {
   }
   const selection = await dialog.showMessageBox({
     type: "warning",
-    buttons: ["自动修复并继续", "暂不启动"],
+    buttons: ["自动选择并继续", "暂不启动"],
     defaultId: 0,
     cancelId: 1,
     title: "需要调整本机连接",
     message: "Gateway 暂时无法使用默认连接地址。",
-    detail: "这通常是因为另一款本地软件正在使用该地址。选择“自动修复并继续”后，应用会自动选择可用地址、更新 Codex 设置并继续启动，无需关闭或排查其他应用。"
+    detail: "这通常是因为另一款本地软件正在使用该地址。选择“自动选择并继续”后，应用会自动选择可用地址并继续启动。"
   });
   if (selection.response !== 0) return null;
   const replacementPort = await findLoopbackPort(controllerPort + 1, [], 4000);
-  writeGatewayPortState(dataDirectory, { controllerPort: replacementPort, codexConfigurationRequired: true });
-  return { controllerPort: replacementPort, codexConfigurationRequired: true, initialized: false, autoConfigureCodex: true };
+  writeGatewayPortState(dataDirectory, { controllerPort: replacementPort, codexConfigurationRequired: false });
+  return { controllerPort: replacementPort, initialized: false };
 }
 
 /**
@@ -197,19 +191,6 @@ async function selectStableControllerPort(dataDirectory) {
 function persistInitialControllerPort(dataDirectory, controllerPort) {
   if (controllerPortIsExplicit || readGatewayPortState(dataDirectory)) return;
   writeGatewayPortState(dataDirectory, { controllerPort, codexConfigurationRequired: false });
-}
-
-/**
- * 判断当前稳定端口是否尚未同步到 Codex 配置。
- * @param {string} dataDirectory Gateway 私密数据目录。
- * @param {number} controllerPort 当前正在监听的 Gateway 代理端口。
- * @returns {boolean} 需要用户执行一键配置时返回 true。
- * @remarks 每次启动 Codex 前重新读取状态，使管理页完成配置后无需重启 Gateway 应用。
- */
-function codexConfigurationRequired(dataDirectory, controllerPort) {
-  const state = readGatewayPortState(dataDirectory);
-  if (!state) return false;
-  return state.codexConfigurationRequired || (controllerPortIsExplicit && state.controllerPort !== controllerPort);
 }
 
 /**
@@ -234,42 +215,19 @@ async function waitForHealth(url, timeoutMs = 15000) {
 }
 
 /**
- * 返回当前平台的 ChatGPT Desktop 应用候选路径。
- * @returns {string} 应用路径，允许通过 CODEX_APP_PATH 覆盖。
- */
-function defaultCodexPath() {
-  if (process.env.CODEX_APP_PATH) return process.env.CODEX_APP_PATH;
-  if (process.platform === "win32") return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Programs", "ChatGPT", "ChatGPT.exe");
-  if (process.platform === "darwin") return "/Applications/ChatGPT.app";
-  return "";
-}
-
-/**
- * 将应用路径转换成 launcher 可直接 spawn 的主进程路径。
- * @param {string} appPath Windows 可执行文件或 macOS app bundle 路径。
- * @returns {string} 可执行文件路径。
- */
-function desktopExecutable(appPath) {
-  if (process.platform === "win32") return appPath;
-  if (process.platform === "darwin" && appPath.endsWith(".app")) return path.join(appPath, "Contents", "MacOS", path.basename(appPath, ".app"));
-  return appPath;
-}
-
-/**
  * 启动本地 Controller 子进程。
  * @param {number} controllerPort HTTP 代理端口。
- * @param {number} uiTlsPort HTTPS 管理页端口。
  * @param {string} dataDirectory 私密数据目录。
- * @param {boolean} autoConfigureCodex 用户确认端口迁移后是否自动同步 Codex 设置。
  * @returns {import("node:child_process").ChildProcess} 已启动的 Controller 子进程。
  * @throws 内置 Node 或 Controller 入口不存在时抛出错误。
  */
-function startController(controllerPort, uiTlsPort, dataDirectory, autoConfigureCodex = false) {
+function startController(controllerPort, dataDirectory) {
   const runtime = runtimeRoot();
   const entry = path.join(runtime, "controller.mjs");
   if (app.isPackaged && (!existsSync(nodeExecutable()) || !existsSync(entry))) {
     throw new Error("安装包缺少 Gateway runtime 文件。");
   }
+  const webDirectory = prepareWebDirectory(runtime, dataDirectory);
   const child = spawn(nodeExecutable(), [entry], {
     cwd: userDataRoot(),
     stdio: "ignore",
@@ -279,10 +237,8 @@ function startController(controllerPort, uiTlsPort, dataDirectory, autoConfigure
       GATEWAY_HOST: "127.0.0.1",
       CONTROLLER_HOST: "127.0.0.1",
       GATEWAY_PORT: String(controllerPort),
-      GATEWAY_UI_TLS_PORT: String(uiTlsPort),
       GATEWAY_DATA_DIR: dataDirectory,
-      GATEWAY_WEB_DIR: path.join(runtime, "dist-web"),
-      GATEWAY_AUTO_CONFIGURE_CODEX: autoConfigureCodex ? "true" : ""
+      GATEWAY_WEB_DIR: webDirectory
     }
   });
   child.once("error", (error) => {
@@ -292,41 +248,28 @@ function startController(controllerPort, uiTlsPort, dataDirectory, autoConfigure
 }
 
 /**
- * 启动 Codex Desktop launcher 子进程。
- * @param {number} controllerPort HTTP 代理端口。
- * @param {number} uiTlsPort HTTPS 管理页端口。
- * @param {string} dataDirectory 私密数据目录。
- * @returns {import("node:child_process").ChildProcess|null} 已启动的 launcher，找不到 Desktop 时返回 null。
+ * 将管理页静态资源复制到用户数据目录中的稳定缓存。
+ * @param {string} runtime Gateway runtime 目录。
+ * @param {string} dataDirectory Gateway 私密数据目录。
+ * @returns {string} Controller 应使用的静态资源目录。
+ * @throws 安装包首次启动且 runtime 与缓存都缺少入口文件时抛出错误。
+ * @remarks 安装包更新可能移走旧的 Contents 目录；缓存放在用户数据目录可让已运行或重启中的 Controller 继续提供管理页。
  */
-function startLauncher(controllerPort, uiTlsPort, dataDirectory) {
-  const appPath = defaultCodexPath();
-  if (!appPath || !existsSync(desktopExecutable(appPath))) {
-    tray?.displayBalloon?.({ title: "Codex Gateway Control", content: "未找到 ChatGPT Desktop，已仅启动 Gateway 管理页。" });
-    return null;
+function prepareWebDirectory(runtime, dataDirectory) {
+  const sourceDirectory = path.join(runtime, "dist-web");
+  const cachedDirectory = path.join(dataDirectory, "dist-web");
+  const sourceIndex = path.join(sourceDirectory, "index.html");
+  const cachedIndex = path.join(cachedDirectory, "index.html");
+  mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
+  if (existsSync(sourceIndex)) {
+    const temporaryDirectory = `${cachedDirectory}.${process.pid}.tmp`;
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+    cpSync(sourceDirectory, temporaryDirectory, { recursive: true, force: true });
+    rmSync(cachedDirectory, { recursive: true, force: true });
+    renameSync(temporaryDirectory, cachedDirectory);
   }
-  const runtime = runtimeRoot();
-  const child = spawn(nodeExecutable(), [path.join(runtime, "launcher.mjs"), "--launch", "--watch", "--open"], {
-    cwd: userDataRoot(),
-    stdio: "ignore",
-    windowsHide: true,
-    env: {
-      ...process.env,
-      GATEWAY_ORIGIN: `http://127.0.0.1:${controllerPort}`,
-      GATEWAY_UI_ORIGIN: `https://127.0.0.1:${uiTlsPort}`,
-      GATEWAY_DATA_DIR: dataDirectory,
-      GATEWAY_RUNTIME_ROOT: runtime,
-      GATEWAY_CONTROLLER_ENTRY: path.join(runtime, "controller.mjs"),
-      CODEX_INJECTION_PATH: path.join(runtime, "inject", "codex-gateway.user.js"),
-      CODEX_APP_PATH: appPath
-    }
-  });
-  child.once("error", (error) => {
-    if (!stopping) dialog.showErrorBox("Codex 启动失败", error.message);
-  });
-  child.once("exit", () => {
-    if (launcher === child) launcher = null;
-  });
-  return child;
+  if (!existsSync(cachedIndex)) throw new Error("安装包缺少管理页静态资源。");
+  return cachedDirectory;
 }
 
 /**
@@ -359,7 +302,7 @@ function stopChild(child) {
  * @param {import("node:child_process").ChildProcess|null} child 需要等待的子进程。
  * @param {number} timeoutMs 最大等待时间。
  * @returns {Promise<boolean>} 子进程在时限内退出时返回 true，否则返回 false。
- * @remarks 只观察 Electron 自己创建的 Controller 或 launcher，不会探测或操作外部进程。
+ * @remarks 只观察 Electron 自己创建的 Controller，不会探测或操作外部进程。
  */
 function waitForChildExit(child, timeoutMs = 3_000) {
   if (!child?.pid || child.exitCode !== null) return Promise.resolve(true);
@@ -377,7 +320,7 @@ function waitForChildExit(child, timeoutMs = 3_000) {
 
 /**
  * 结束并确认 Electron 自己启动的子进程已经退出。
- * @param {import("node:child_process").ChildProcess|null} child 需要结束的 Controller 或 launcher。
+ * @param {import("node:child_process").ChildProcess|null} child 需要结束的 Controller。
  * @returns {Promise<void>} 退出信号完成处理后返回。
  * @remarks 常规 SIGTERM 超时后仅对本子进程发送 SIGKILL，避免 CGC 退出后遗留 Node 进程。
  */
@@ -389,41 +332,12 @@ async function stopChildAndWait(child) {
 }
 
 /**
- * 重启 launcher 并创建新的 Gateway-enabled Codex 实例。
- * @returns {Promise<void>} 旧 launcher 结束且新 launcher 创建后返回。
- * @throws Gateway 尚未完成启动时抛出错误。
- * @remarks 先结束旧 watcher，防止两个 launcher 对同一独立 profile 或 CDP 端口竞争。
- */
-async function restartLauncher() {
-  if (!controllerOrigin || !gatewayUiOrigin) throw new Error("Gateway 尚未准备完成。");
-  const dataDirectory = path.join(userDataRoot(), "data");
-  if (codexConfigurationRequired(dataDirectory, Number(new URL(controllerOrigin).port))) {
-    await openManagementPage();
-    await dialog.showMessageBox({
-      type: "warning",
-      title: "需要更新 Codex 配置",
-      message: "Gateway 代理端口已更换，尚未同步到 Codex。",
-      detail: "请在已打开的管理页执行“一键配置”，然后重启 Codex。"
-    });
-    return;
-  }
-  const previous = launcher;
-  launcher = null;
-  await stopChildAndWait(previous);
-  if (stopping) return;
-  launcher = startLauncher(
-    Number(new URL(controllerOrigin).port),
-    Number(new URL(gatewayUiOrigin).port),
-    dataDirectory
-  );
-}
-
-/**
  * 创建托盘入口并绑定常用操作。
  * @returns {void} 托盘菜单创建完成后返回。
  */
 function createTray() {
-  const iconName = "cgc-tray-template.png";
+  // macOS 菜单栏会把模板图按系统主题着色；Windows/Linux 托盘需要保留应用图标的彩色像素。
+  const iconName = process.platform === "darwin" ? "cgc-tray-template.png" : "cgc-app-icon.png";
   const sourceIcon = nativeImage.createFromPath(path.join(__dirname, "assets", iconName));
   if (sourceIcon.isEmpty()) throw new Error("无法加载菜单栏图标资源。");
   const icon = sourceIcon.resize({ width: 18, height: 18, quality: "best" });
@@ -432,7 +346,6 @@ function createTray() {
   tray.setToolTip("Codex Gateway Control");
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: "打开管理页", click: () => void openManagementPage() },
-    { label: "启动 Codex", click: () => void restartLauncher().catch((error) => dialog.showErrorBox("Codex 启动失败", error.message)) },
     { type: "separator" },
     { label: "退出", click: () => app.quit() }
   ]));
@@ -464,7 +377,7 @@ function createKeepAliveWindow() {
 }
 
 /**
- * 启动 Gateway 和可选 Codex 注入流程。
+ * 启动 Gateway Controller 和本地管理页。
  * @returns {Promise<void>} 所有本地服务初始化完成后结束。
  * @throws 端口、Node runtime 或 Controller 启动失败时抛出错误。
  */
@@ -477,23 +390,11 @@ async function startApplication() {
     return;
   }
   const controllerPort = selection.controllerPort;
-  const uiTlsPort = await findLoopbackPort(preferredUiTlsPort, [controllerPort], 4401);
   controllerOrigin = `http://127.0.0.1:${controllerPort}`;
-  gatewayUiOrigin = `https://127.0.0.1:${uiTlsPort}`;
-  controller = startController(controllerPort, uiTlsPort, dataDirectory, selection.autoConfigureCodex);
+  controller = startController(controllerPort, dataDirectory);
   await waitForHealth(`${controllerOrigin}/health`);
   if (selection.initialized) persistInitialControllerPort(dataDirectory, controllerPort);
-  if (codexConfigurationRequired(dataDirectory, controllerPort)) {
-    await openManagementPage();
-    await dialog.showMessageBox({
-      type: "warning",
-      title: selection.autoConfigureCodex ? "无法完成自动修复" : "需要完成设置更新",
-      message: selection.autoConfigureCodex ? "Gateway 已准备好，但未能自动更新 Codex 设置。" : "Gateway 的本机连接设置尚未同步到 Codex。",
-      detail: "已打开管理页。请点击“一键配置”完成更新，然后再从菜单栏启动 Codex。"
-    });
-    return;
-  }
-  launcher = startLauncher(controllerPort, uiTlsPort, dataDirectory);
+  await openManagementPage();
 }
 
 if (!singleInstance) {
@@ -504,7 +405,7 @@ if (!singleInstance) {
     if (stopping) return;
     event.preventDefault();
     stopping = true;
-    void Promise.all([stopChildAndWait(launcher), stopChildAndWait(controller)]).finally(() => {
+    void stopChildAndWait(controller).finally(() => {
       tray?.destroy();
       keepAliveWindow?.destroy();
       app.exit(0);
