@@ -15,6 +15,11 @@ let keepAliveWindow = null;
 let controller = null;
 let stopping = false;
 let controllerOrigin = null;
+let controllerPort = null;
+let controllerDataDirectory = null;
+let controllerRestartTimer = null;
+let controllerRestartAttempts = 0;
+let controllerReady = false;
 
 /**
  * 返回不包含人为添加空格目录名的安装版用户数据根目录。
@@ -238,13 +243,80 @@ function startController(controllerPort, dataDirectory) {
       CONTROLLER_HOST: "127.0.0.1",
       GATEWAY_PORT: String(controllerPort),
       GATEWAY_DATA_DIR: dataDirectory,
-      GATEWAY_WEB_DIR: webDirectory
+      GATEWAY_WEB_DIR: webDirectory,
+      GATEWAY_LAUNCHER_PID: String(process.pid)
     }
   });
   child.once("error", (error) => {
     if (!stopping) dialog.showErrorBox("Gateway 启动失败", error.message);
   });
   return child;
+}
+
+/**
+ * 计算 Controller 异常退出后的下一次重启等待时间。
+ * @param {number} attempts 已连续失败的重启次数。
+ * @returns {number} 下一次重启前应等待的毫秒数。
+ * @remarks 使用有限指数退避，避免持续崩溃时占用 CPU，同时保证本机管理页会自行恢复。
+ */
+function controllerRestartDelay(attempts) {
+  return Math.min(1_000 * 2 ** Math.min(attempts, 4), 15_000);
+}
+
+/**
+ * 为已成功启动的 Controller 注册异常退出守护。
+ * @param {import("node:child_process").ChildProcess} child 当前由 Electron 创建的 Controller 子进程。
+ * @returns {void} 退出监听注册完成后返回。
+ * @remarks 正常退出 CGC 时由 stopping 标记抑制重启；只处理当前实例，避免旧退出事件影响新实例。
+ */
+function watchController(child) {
+  child.once("exit", (code, signal) => {
+    if (controller !== child) return;
+    controller = null;
+    if (stopping || !controllerReady) return;
+    const reason = signal ? `信号 ${signal}` : `退出码 ${code ?? "未知"}`;
+    console.error(`Gateway Controller 意外退出（${reason}），将自动重启。`);
+    scheduleControllerRestart();
+  });
+}
+
+/**
+ * 安排当前稳定端口上的 Controller 重启。
+ * @returns {void} 重启任务已安排或无需安排时返回。
+ * @remarks 同一时刻最多保留一个定时器，端口保持不变，避免已配置的 Codex 请求入口失效。
+ */
+function scheduleControllerRestart() {
+  if (stopping || controller || controllerRestartTimer || !controllerOrigin || !controllerPort || !controllerDataDirectory) return;
+  const delay = controllerRestartDelay(controllerRestartAttempts);
+  controllerRestartAttempts += 1;
+  console.error(`Gateway Controller 将在 ${Math.round(delay / 1_000)} 秒后重启。`);
+  controllerRestartTimer = setTimeout(() => {
+    controllerRestartTimer = null;
+    void restartController();
+  }, delay);
+}
+
+/**
+ * 在既定本机端口重新启动 Controller 并恢复健康检查。
+ * @returns {Promise<void>} 本次重启成功或下一次重试已安排后完成。
+ * @remarks 重启失败不会改变 Codex 已使用的端口；失败原因写入 Electron 控制台，后续按退避策略继续尝试。
+ */
+async function restartController() {
+  if (stopping || controller || !controllerOrigin || !controllerPort || !controllerDataDirectory) return;
+  let child = null;
+  try {
+    child = startController(controllerPort, controllerDataDirectory);
+    controller = child;
+    watchController(child);
+    await waitForHealth(`${controllerOrigin}/health`);
+    controllerRestartAttempts = 0;
+    console.log("Gateway Controller 已自动恢复。");
+  } catch (error) {
+    if (controller === child) controller = null;
+    stopChild(child);
+    console.error(`Gateway Controller 自动重启失败：${error instanceof Error ? error.message : String(error)}`);
+    scheduleControllerRestart();
+  }
 }
 
 /**
@@ -389,10 +461,14 @@ async function startApplication() {
     app.quit();
     return;
   }
-  const controllerPort = selection.controllerPort;
+  controllerPort = selection.controllerPort;
+  controllerDataDirectory = dataDirectory;
   controllerOrigin = `http://127.0.0.1:${controllerPort}`;
   controller = startController(controllerPort, dataDirectory);
+  watchController(controller);
   await waitForHealth(`${controllerOrigin}/health`);
+  if (!controller) throw new Error("Gateway Controller 在完成健康检查前已退出。");
+  controllerReady = true;
   if (selection.initialized) persistInitialControllerPort(dataDirectory, controllerPort);
   await openManagementPage();
 }
@@ -405,6 +481,7 @@ if (!singleInstance) {
     if (stopping) return;
     event.preventDefault();
     stopping = true;
+    if (controllerRestartTimer) clearTimeout(controllerRestartTimer);
     void stopChildAndWait(controller).finally(() => {
       tray?.destroy();
       keepAliveWindow?.destroy();

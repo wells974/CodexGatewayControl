@@ -661,6 +661,24 @@ app.get("/{*path}", (_request, response) => {
 
 const httpServer = app.listen(config.port, config.host, () => console.log(`Codex Gateway 代理已监听 http://${config.host}:${config.port}`));
 
+let launcherExitHandled = false;
+
+/**
+ * 在桌面启动器消失时关闭已失去父进程的 Controller。
+ * @returns 无返回值。
+ * @remarks 仅在 Electron 明确传入父进程 PID 时启用；强制结束桌面应用后，子进程会被系统收养为 PID 1，此时主动退出可释放旧端口和 SQLite 句柄。
+ */
+function stopOrphanedController(): void {
+  const launcherPid = Number(process.env.GATEWAY_LAUNCHER_PID);
+  if (!Number.isSafeInteger(launcherPid) || launcherPid <= 1 || launcherExitHandled || process.ppid === launcherPid) return;
+  launcherExitHandled = true;
+  console.error("Gateway 桌面启动器已退出，Controller 将停止以释放本机端口。");
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 1_000).unref();
+}
+
+setInterval(stopOrphanedController, 3_000).unref();
+
 /**
  * 在本地监听端口不可用时退出，避免留下半可用 Controller。
  * @param protocol 发生错误的监听协议名称。
